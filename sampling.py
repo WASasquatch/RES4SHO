@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 HF-Detail Sampling -- exponential integrator with spectral high-frequency
 emphasis (HFE), tuned for realistic detail preservation.
@@ -1896,6 +1895,15 @@ def _register_schedulers() -> None:
         if name not in names:
             names.append(name)
         comfy_samplers.SCHEDULER_NAMES = names
+
+        KSampler = getattr(comfy_samplers, "KSampler", None)
+        if KSampler is not None and hasattr(KSampler, "SCHEDULERS"):
+            sched_list = getattr(KSampler, "SCHEDULERS")
+            if not isinstance(sched_list, list):
+                sched_list = list(sched_list)
+            if name not in sched_list:
+                sched_list.append(name)
+                KSampler.SCHEDULERS = sched_list
 
     LOGGER.info("HFE schedulers registered: %s", list(_SCHEDULERS.keys()))
 

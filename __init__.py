@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 RES4SHO -- High-Frequency Detail Sampling for ComfyUI
 
