@@ -107,6 +107,21 @@ def _phi3(h: torch.Tensor) -> torch.Tensor:
 #   Spectral detail extraction
 # =====================================================================
 
+def _clamp_boost(boost: torch.Tensor, eps: torch.Tensor,
+                 max_ratio: float = 0.35) -> torch.Tensor:
+    """Clamp HF boost so its RMS doesn't exceed max_ratio * eps RMS.
+
+    Prevents the HFE injection from overwhelming the denoising signal,
+    especially for higher stage counts where the inter-stage delta is
+    naturally larger.
+    """
+    eps_rms = eps.square().mean().sqrt().clamp(min=1e-8)
+    boost_rms = boost.square().mean().sqrt()
+    if boost_rms > max_ratio * eps_rms:
+        boost = boost * (max_ratio * eps_rms / boost_rms)
+    return boost
+
+
 def _extract_hf(t: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
     """
     Spatial high-pass via residual after box blur.
@@ -120,65 +135,6 @@ def _extract_hf(t: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
     padded = F.pad(t, [pad, pad, pad, pad], mode='reflect')
     low = F.avg_pool2d(padded, kernel_size, stride=1)
     return t - low
-
-
-def _extract_hf_pyramid(t: torch.Tensor, levels: int = 3) -> list:
-    """
-    Laplacian pyramid: decompose into multiple frequency bands.
-
-    Returns a list of [fine, medium, coarse] band tensors.
-    Each band captures progressively lower spatial frequencies via
-    increasing kernel sizes (3, 5, 7, ...).
-    """
-    if t.ndim != 4:
-        return [torch.zeros_like(t)] * levels
-    bands = []
-    current = t
-    for lvl in range(levels):
-        ks = 3 + 2 * lvl  # 3, 5, 7
-        pad = ks // 2
-        padded = F.pad(current, [pad, pad, pad, pad], mode='reflect')
-        blurred = F.avg_pool2d(padded, ks, stride=1)
-        bands.append(current - blurred)
-        current = blurred
-    return bands
-
-
-def _extract_hf_fft(t: torch.Tensor, cutoff: float = 0.3) -> torch.Tensor:
-    """
-    FFT high-pass filter with smooth ramp.
-
-    Extracts frequencies above ``cutoff`` (fraction of Nyquist).
-    Ramps linearly from 0 at cutoff to 1 at 0.5 (Nyquist).
-    """
-    if t.ndim != 4:
-        return torch.zeros_like(t)
-    H, W = t.shape[2], t.shape[3]
-    freq = torch.fft.rfft2(t)
-    fy = torch.fft.fftfreq(H, device=t.device).unsqueeze(1)
-    fx = torch.fft.rfftfreq(W, device=t.device).unsqueeze(0)
-    freq_mag = torch.sqrt(fy ** 2 + fx ** 2)
-    ramp_width = max(0.5 - cutoff, 1e-6)
-    mask = torch.clamp((freq_mag - cutoff) / ramp_width, 0.0, 1.0)
-    return torch.fft.irfft2(freq * mask, s=(H, W))
-
-
-def _spatial_gate(delta: torch.Tensor, window: int = 7) -> torch.Tensor:
-    """
-    Per-pixel gate based on local energy of the correction delta.
-
-    Returns a [0, 1] spatial map: 1 in high-variance regions (faces,
-    text, fine objects) where emphasis helps; 0 in smooth areas (sky,
-    gradients) where emphasis would add noise.
-    """
-    if delta.ndim != 4:
-        return torch.ones_like(delta)
-    energy = delta ** 2
-    pad = window // 2
-    padded = F.pad(energy, [pad, pad, pad, pad], mode='reflect')
-    local_energy = F.avg_pool2d(padded, window, stride=1)
-    e_max = local_energy.amax(dim=(-1, -2), keepdim=True).clamp(min=1e-8)
-    return local_energy / e_max
 
 
 # =====================================================================
@@ -201,12 +157,28 @@ def _plot_sigmas(sigmas: torch.Tensor, name: str,
     if y_span < 1e-12:
         return
 
-    # Build character canvas
-    grid = [[' '] * width for _ in range(height)]
-    for i, v in enumerate(vals):
-        c = int(i * (width - 1) / (n - 1) + 0.5)
+    # Interpolate: for each column, compute the y value by linearly
+    # interpolating between the two nearest data points.
+    col_row = [0] * width
+    for c in range(width):
+        t = c * (n - 1) / (width - 1)        # fractional step index
+        lo_i = min(int(t), n - 2)
+        hi_i = lo_i + 1
+        frac = t - lo_i
+        v = vals[lo_i] * (1.0 - frac) + vals[hi_i] * frac
         r = int((y_hi - v) * (height - 1) / y_span + 0.5)
-        grid[max(0, min(height - 1, r))][max(0, min(width - 1, c))] = '*'
+        col_row[c] = max(0, min(height - 1, r))
+
+    # Build character canvas with connected line segments
+    grid = [[' '] * width for _ in range(height)]
+    for c in range(width):
+        if c == 0:
+            grid[col_row[c]][c] = '*'
+        else:
+            r0, r1 = col_row[c - 1], col_row[c]
+            lo_r, hi_r = min(r0, r1), max(r0, r1)
+            for r in range(lo_r, hi_r + 1):
+                grid[r][c] = '*'
 
     # Y-axis label positions (5 evenly spaced)
     label_rows = {0, height // 4, height // 2, 3 * height // 4, height - 1}
@@ -319,7 +291,7 @@ def _sample_hfe(
             if eta_step > 1e-3:
                 delta = eps_2 - eps_1
                 delta_hf = _extract_hf(delta)
-                eps_2 = eps_2 + eta_step * delta_hf
+                eps_2 = eps_2 + _clamp_boost(eta_step * delta_hf, eps_2)
 
         # --- Output weights (standard res_2s) ---
         b2 = phi2 / c2
@@ -445,7 +417,7 @@ def _sample_hfe_auto(
         eta_step = eta_peak * envelope * content_gate
 
         if eta_step > 1e-3:
-            eps_2 = eps_2 + eta_step * delta_hf
+            eps_2 = eps_2 + _clamp_boost(eta_step * delta_hf, eps_2)
 
         # --- Output weights (change every step with adaptive c2) ---
         b2 = phi2 / c2
@@ -564,7 +536,7 @@ def _sample_hfe_3s(
             if eta_step > 1e-3:
                 delta = eps_3 - eps_1
                 delta_hf = _extract_hf(delta)
-                eps_3 = eps_3 + eta_step * delta_hf
+                eps_3 = eps_3 + _clamp_boost(eta_step * delta_hf, eps_3)
 
         # --- Output weights ---
         b3 = phi2_h / (gamma * c2 + c3)
@@ -660,7 +632,7 @@ def _sample_hfe_3s_auto(
         eta_step = eta_peak * envelope * content_gate
 
         if eta_step > 1e-3:
-            eps_3 = eps_3 + eta_step * delta_hf
+            eps_3 = eps_3 + _clamp_boost(eta_step * delta_hf, eps_3)
 
         # --- Output weights ---
         b3 = phi2_h / (gamma * c2 + c3)
@@ -690,7 +662,7 @@ def sample_hfe3_auto(model, x, sigmas, extra_args=None, callback=None, disable=F
     """3-stage adaptive HFE."""
     LOGGER.info(">>> hfe3_auto sampler invoked (%d sigmas)", len(sigmas))
     return _sample_hfe_3s_auto(model, x, sigmas, extra_args, callback, disable,
-                               eta_peak=0.55)
+                               eta_peak=0.275)
 
 
 # =====================================================================
@@ -787,7 +759,7 @@ def _sample_hfe_4s(
             if eta_step > 1e-3:
                 delta = eps_4 - eps_1
                 delta_hf = _extract_hf(delta)
-                eps_4 = eps_4 + eta_step * delta_hf
+                eps_4 = eps_4 + _clamp_boost(eta_step * delta_hf, eps_4)
 
         # --- Output weights (Strehmel-Weiner, b2=0) ---
         b3 = 4.0 * phi2_h - 8.0 * phi3_h
@@ -893,7 +865,7 @@ def _sample_hfe_4s_auto(
         eta_step = eta_peak * envelope * content_gate
 
         if eta_step > 1e-3:
-            eps_4 = eps_4 + eta_step * delta_hf
+            eps_4 = eps_4 + _clamp_boost(eta_step * delta_hf, eps_4)
 
         # --- Output weights ---
         b2 = 0.0
@@ -924,7 +896,7 @@ def sample_hfe4_auto(model, x, sigmas, extra_args=None, callback=None, disable=F
     """4-stage adaptive HFE."""
     LOGGER.info(">>> hfe4_auto sampler invoked (%d sigmas)", len(sigmas))
     return _sample_hfe_4s_auto(model, x, sigmas, extra_args, callback, disable,
-                               eta_peak=0.55)
+                               eta_peak=0.183)
 
 
 # =====================================================================
@@ -1037,7 +1009,7 @@ def _sample_hfe_5s(
             if eta_step > 1e-3:
                 delta = eps_5 - eps_1
                 delta_hf = _extract_hf(delta)
-                eps_5 = eps_5 + eta_step * delta_hf
+                eps_5 = eps_5 + _clamp_boost(eta_step * delta_hf, eps_5)
 
         # --- Output weights (b2=0, b3=0) ---
         b4 = -phi2_h + 4.0 * phi3_h
@@ -1156,7 +1128,7 @@ def _sample_hfe_5s_auto(
         eta_step = eta_peak * envelope * content_gate
 
         if eta_step > 1e-3:
-            eps_5 = eps_5 + eta_step * delta_hf
+            eps_5 = eps_5 + _clamp_boost(eta_step * delta_hf, eps_5)
 
         # --- Output weights (b2=0, b3=0) ---
         b4 = -phi2_h + 4.0 * phi3_h
@@ -1186,7 +1158,7 @@ def sample_hfe5_auto(model, x, sigmas, extra_args=None, callback=None, disable=F
     """5-stage adaptive HFE."""
     LOGGER.info(">>> hfe5_auto sampler invoked (%d sigmas)", len(sigmas))
     return _sample_hfe_5s_auto(model, x, sigmas, extra_args, callback, disable,
-                               eta_peak=0.55)
+                               eta_peak=0.138)
 
 
 # =====================================================================
@@ -1219,6 +1191,10 @@ def _make_hfe_preset(level: int, stages: int = 2):
     core_fn, prefix = _STAGE_CORES[stages]
     t = level / (_HFE_LEVELS - 1)
     eta = _HFE_ETA_MAX * (t ** 1.5)
+    # Compensate: higher stage counts produce larger inter-stage deltas,
+    # so the same eta hits much harder.  Scale inversely with stages.
+    if stages > 2:
+        eta = eta / (stages - 1)
 
     if stages == 2:
         # 2-stage: also vary c2
@@ -1258,18 +1234,27 @@ for _stages in (2, 3, 4, 5):
 #   Experimental HFE samplers  (hfx_*)
 # =====================================================================
 #
-#   Each variant modifies HOW high-frequency detail is extracted and/or
-#   applied, using a shared 2-stage exponential integrator base.
+#   Four fundamentally different enhancement modes, all using a shared
+#   2-stage exponential integrator base (c2=0.65, eta=0.25):
 #
-#   All use fixed moderate strength (c2=0.65, eta=0.25) for direct
-#   comparison against hfe_s5.
+#     sharp      - Unsharp mask on eps_2 (inside integrator)
+#     boost      - Uniform eps_2 scaling / lying sigma (inside integrator)
+#     detail     - Post-step HF injection from denoised_2
+#     stochastic - Structure-aware noise injection (post-step, non-det)
+#     momentum   - Cross-step temporal EMA on denoised (inside integrator)
+#     spectral   - FFT frequency reshaping of eps_2 (inside integrator)
+#     orthogonal - Gram-Schmidt novel-info amplification (inside integrator)
+#     refine     - ODE curvature-adaptive spatial emphasis (inside integrator)
+#     focus      - Value-domain power-law contrast (inside integrator)
+#     coherence  - Inter-stage FFT phase coherence gating (inside integrator)
 
 _HFX_C2 = 0.65
 _HFX_ETA = 0.25
 _HFX_SDE_STRENGTH = 0.08
-_HFX_MOM_BETA = 0.7
-_HFX_FFT_CUTOFF = 0.3
-_HFX_LAP_WEIGHTS = (1.5, 1.0, 0.5)
+_HFX_BOOST_FACTOR = 0.5
+_HFX_MOMENTUM_STRENGTH = 0.35
+_HFX_SPECTRAL_ALPHA = 0.6
+_HFX_FOCUS_GAMMA = 0.8
 
 
 @torch.no_grad()
@@ -1283,44 +1268,59 @@ def _sample_hfx(
     *,
     c2: float = _HFX_C2,
     eta: float = _HFX_ETA,
-    mode: str = 'lap',
-    # Per-mode overrides (use module defaults when None)
-    lap_weights: Optional[tuple] = None,
-    mom_beta: Optional[float] = None,
-    fft_cutoff: Optional[float] = None,
+    mode: str = 'sharp',
+    # Per-mode overrides
+    boost_factor: Optional[float] = None,
     sde_strength: Optional[float] = None,
-    spatial_window: Optional[int] = None,
+    momentum_strength: Optional[float] = None,
+    spectral_alpha: Optional[float] = None,
+    focus_gamma: Optional[float] = None,
 ) -> torch.Tensor:
     """
-    Generic experimental HFE sampler.
+    Experimental HFE sampler with 10 fundamentally different enhancement modes.
 
     mode:
-      'lap'     -- Laplacian pyramid multi-scale (3 bands, weighted)
-      'mom'     -- correction momentum (EMA across steps)
-      'fft'     -- FFT spectral high-pass with smooth cutoff
-      'sde'     -- stochastic HF noise injection after update
-      'spatial' -- spatially-adaptive per-pixel gating
-    Hybrid modes (combine two techniques):
-      'lap_mom'     -- Laplacian pyramid + momentum accumulation
-      'lap_spatial' -- Laplacian pyramid + spatial gating
-      'fft_spatial' -- FFT spectral + spatial gating
+      'sharp'      -- Unsharp mask on eps_2 inside integrator: amplifies the
+                       model's own fine-scale predictions.
+      'boost'      -- Uniform eps_2 scaling inside integrator ("lying sigma"):
+                       makes the model take a larger step toward its prediction.
+      'detail'     -- Post-step HF injection from denoised_2: adds detail the
+                       model predicted but the integrator smoothed away.
+      'stochastic' -- Structure-aware noise injection post-step: non-deterministic
+                       variation weighted by local image detail.
+      'momentum'   -- Cross-step temporal EMA: amplifies the direction the model's
+                       prediction is moving between steps (temporal memory).
+      'spectral'   -- FFT frequency reshaping of eps_2: power-law spectral boost
+                       for precise frequency band control.
+      'orthogonal' -- Gram-Schmidt projection: amplifies the component of eps_2
+                       orthogonal to eps_1 (novel information from stage 2).
+      'refine'     -- ODE curvature-adaptive emphasis: amplifies eps_2 more where
+                       |eps_2 - eps_1| is high (local truncation error is large).
+      'focus'      -- Value-domain power-law contrast: nonlinear gain based on
+                       element-wise magnitude (divisive normalization).
+      'coherence'  -- Inter-stage FFT phase coherence gating: amplifies frequency
+                       bins where eps_1 and eps_2 agree structurally.
     """
     if extra_args is None:
         extra_args = {}
 
-    # Resolve per-mode defaults
-    _lap_w = lap_weights or _HFX_LAP_WEIGHTS
-    _mom_b = mom_beta if mom_beta is not None else _HFX_MOM_BETA
-    _fft_c = fft_cutoff if fft_cutoff is not None else _HFX_FFT_CUTOFF
+    _boost_f = boost_factor if boost_factor is not None else _HFX_BOOST_FACTOR
     _sde_s = sde_strength if sde_strength is not None else _HFX_SDE_STRENGTH
-    _sp_win = spatial_window if spatial_window is not None else 7
+    _momentum_s = momentum_strength if momentum_strength is not None else _HFX_MOMENTUM_STRENGTH
+    _spectral_a = spectral_alpha if spectral_alpha is not None else _HFX_SPECTRAL_ALPHA
+    _focus_g = focus_gamma if focus_gamma is not None else _HFX_FOCUS_GAMMA
 
     s_in = x.new_ones([x.shape[0]])
     sigmas = sigmas.to(device=x.device, dtype=x.dtype)
     total_steps = len(sigmas) - 1
 
-    # Per-mode state
-    momentum_buf = None
+    # Schedule-based denoise gate: full for txt2img (sigmas[0] >= 0.7),
+    # quadratically suppressed for img2img (truncated schedule).
+    _max_sigma = float(sigmas[0])
+    _denoise_gate = min(1.0, (_max_sigma / 0.7) ** 2)
+
+    # Cross-step state for momentum mode
+    denoised_prev = None
 
     for i in trange(total_steps, disable=disable):
         sigma = sigmas[i]
@@ -1347,71 +1347,142 @@ def _sample_hfx(
         X_2 = x + h * a21 * eps_1
         sigma_mid = sigma * torch.exp(-c2 * h)
         denoised_2 = model(X_2, sigma_mid * s_in, **extra_args)
+        denoised_2_orig = denoised_2  # Preserve for momentum tracking
         eps_2 = denoised_2 - x
 
-        # --- Experimental HFE ---
+        # --- Sigma warmup gate ---
         progress = i / max(total_steps - 1, 1)
         sigma_gate = max(0.0, min(1.0, (progress - 0.25) / 0.30))
         eta_step = eta * sigma_gate
 
-        if eta_step > 1e-3 and mode != 'sde':
-            delta = eps_2 - eps_1
+        # Save eps_2 before any mode touches it (for per-step safety cap)
+        eps_2_pre = eps_2
 
-            if mode == 'lap':
-                bands = _extract_hf_pyramid(delta, levels=3)
-                correction = sum(w * b for w, b in zip(_lap_w, bands))
-                eps_2 = eps_2 + eta_step * correction
+        # --- Mode: momentum (inside integrator -- temporal EMA on denoised_2) ---
+        if mode == 'momentum' and eta_step > 1e-3 and denoised_prev is not None:
+            temporal_diff = denoised_2 - denoised_prev
+            denoised_2 = denoised_2 + eta_step * _momentum_s * temporal_diff
+            eps_2 = denoised_2 - x  # Recalculate eps_2 from modified denoised_2
 
-            elif mode == 'mom':
-                delta_hf = _extract_hf(delta)
-                if momentum_buf is None:
-                    momentum_buf = delta_hf.clone()
-                else:
-                    momentum_buf = (_mom_b * momentum_buf
-                                    + (1.0 - _mom_b) * delta_hf)
-                eps_2 = eps_2 + eta_step * momentum_buf
+        # --- Mode: sharp (inside integrator -- modify eps_2) ---
+        if mode == 'sharp' and eta_step > 1e-3:
+            ks = 5
+            pad = ks // 2
+            padded = F.pad(eps_2, [pad] * 4, mode='reflect')
+            lowpass = F.avg_pool2d(padded, ks, stride=1)
+            highpass = eps_2 - lowpass
+            eps_2 = eps_2 + eta_step * 3.0 * highpass
 
-            elif mode == 'fft':
-                delta_hf = _extract_hf_fft(delta, cutoff=_fft_c)
-                eps_2 = eps_2 + eta_step * delta_hf
+        # --- Mode: boost (inside integrator -- scale eps_2) ---
+        elif mode == 'boost' and eta_step > 1e-3:
+            eps_2 = eps_2 * (1.0 + eta_step * _boost_f)
 
-            elif mode == 'spatial':
-                delta_hf = _extract_hf(delta)
-                gate = _spatial_gate(delta, window=_sp_win)
-                eps_2 = eps_2 + eta_step * gate * delta_hf
+        # --- Mode: spectral (inside integrator -- FFT frequency reshaping) ---
+        elif mode == 'spectral' and eta_step > 1e-3:
+            h_dim, w_dim = eps_2.shape[-2], eps_2.shape[-1]
+            eps_fft = torch.fft.rfft2(eps_2)
+            y_freq = torch.fft.fftfreq(h_dim, device=eps_2.device)
+            x_freq = torch.fft.rfftfreq(w_dim, device=eps_2.device)
+            freq = torch.sqrt(y_freq[:, None] ** 2 + x_freq[None, :] ** 2).clamp(min=1e-10)
+            boost = freq.pow(_spectral_a)
+            boost = boost / boost.mean()
+            eps_fft = eps_fft * (1.0 + eta_step * (boost - 1.0))
+            eps_2 = torch.fft.irfft2(eps_fft, s=(h_dim, w_dim))
 
-            elif mode == 'lap_mom':
-                bands = _extract_hf_pyramid(delta, levels=3)
-                correction = sum(w * b for w, b in zip(_lap_w, bands))
-                if momentum_buf is None:
-                    momentum_buf = correction.clone()
-                else:
-                    momentum_buf = (_mom_b * momentum_buf
-                                    + (1.0 - _mom_b) * correction)
-                eps_2 = eps_2 + eta_step * momentum_buf
+        # --- Mode: orthogonal (inside integrator -- Gram-Schmidt) ---
+        elif mode == 'orthogonal' and eta_step > 1e-3:
+            e1 = eps_1.reshape(eps_1.shape[0], -1)
+            e2 = eps_2.reshape(eps_2.shape[0], -1)
+            e1_norm = e1 / e1.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            proj_coeff = (e2 * e1_norm).sum(dim=-1, keepdim=True)
+            projection = proj_coeff * e1_norm
+            ortho = (e2 - projection).reshape_as(eps_2)
+            eps_2 = eps_2 + eta_step * ortho
 
-            elif mode == 'lap_spatial':
-                bands = _extract_hf_pyramid(delta, levels=3)
-                correction = sum(w * b for w, b in zip(_lap_w, bands))
-                gate = _spatial_gate(delta, window=_sp_win)
-                eps_2 = eps_2 + eta_step * gate * correction
+        # --- Mode: refine (inside integrator -- ODE curvature-adaptive) ---
+        elif mode == 'refine' and eta_step > 1e-3:
+            curvature = (eps_2 - eps_1).abs()
+            ks = 5
+            pad = ks // 2
+            padded = F.pad(curvature, [pad] * 4, mode='reflect')
+            curvature_smooth = F.avg_pool2d(padded, ks, stride=1)
+            curvature_norm = curvature_smooth / curvature_smooth.mean().clamp(min=1e-8)
+            eps_2 = eps_2 * (1.0 + eta_step * (curvature_norm - 1.0))
 
-            elif mode == 'fft_spatial':
-                delta_hf = _extract_hf_fft(delta, cutoff=_fft_c)
-                gate = _spatial_gate(delta, window=_sp_win)
-                eps_2 = eps_2 + eta_step * gate * delta_hf
+        # --- Mode: focus (inside integrator -- value-domain contrast) ---
+        elif mode == 'focus' and eta_step > 1e-3:
+            eps_mag = eps_2.abs().clamp(min=1e-8)
+            eps_ref = eps_mag.mean()
+            gain = (eps_mag / eps_ref).pow(_focus_g)
+            gain = gain / gain.mean()  # energy preservation
+            eps_2 = eps_2 * (1.0 + eta_step * (gain - 1.0))
 
-        # --- Output weights ---
+        # --- Mode: coherence (inside integrator -- phase coherence gating) ---
+        elif mode == 'coherence' and eta_step > 1e-3:
+            h_dim, w_dim = eps_2.shape[-2], eps_2.shape[-1]
+            e1_fft = torch.fft.rfft2(eps_1)
+            e2_fft = torch.fft.rfft2(eps_2)
+            phase_diff = torch.angle(e2_fft * e1_fft.conj())
+            coh = torch.cos(phase_diff)
+            gate = 1.0 + eta_step * coh
+            eps_2 = torch.fft.irfft2(e2_fft * gate, s=(h_dim, w_dim))
+
+        # --- Per-step safety cap on eps_2 modification ---
+        # Prevents compounding across steps from corrupting colors/structure.
+        # Cap delta to 10% of original eps_2 RMS per step.
+        if mode not in ('detail', 'stochastic') and eta_step > 1e-3:
+            _delta = eps_2 - eps_2_pre
+            _d_rms = _delta.square().mean().sqrt()
+            if _d_rms > 1e-8:
+                _ref_rms = eps_2_pre.square().mean().sqrt().clamp(min=1e-8)
+                _cap = 0.10 * _ref_rms
+                if _d_rms > _cap:
+                    eps_2 = eps_2_pre + _delta * (_cap / _d_rms)
+
+        # --- Output weights (standard integrator step) ---
         b2 = phi2_h / c2
         b1 = phi1_h - b2
-
         x = x + h * (b1 * eps_1 + b2 * eps_2)
 
-        # --- SDE: post-update HF noise injection ---
-        if mode == 'sde' and eta_step > 1e-3:
-            noise = torch.randn_like(x)
-            noise_hf = _extract_hf(noise)
-            x = x + (_sde_s * float(sigma_next) * sigma_gate * noise_hf)
+        # --- Mode: detail (post-step -- inject HF from denoised_2) ---
+        if mode == 'detail' and eta_step > 1e-3:
+            ks = 5
+            pad = ks // 2
+            padded = F.pad(denoised_2, [pad] * 4, mode='reflect')
+            lowpass = F.avg_pool2d(padded, ks, stride=1)
+            hf = denoised_2 - lowpass
+            sigma_scale = float(sigma)
+            corr_applied = eta_step * _denoise_gate * sigma_scale * hf
+
+            # Safety cap: limit to 3% of x RMS
+            _x_rms = x.square().mean().sqrt().clamp(min=1e-8)
+            _cap = 0.03 * _x_rms
+            _ca_rms = corr_applied.square().mean().sqrt()
+            if _ca_rms > _cap:
+                corr_applied = corr_applied * (_cap / _ca_rms)
+
+            # Apply with mean preservation
+            x_mean = x.mean(dim=(-2, -1), keepdim=True)
+            x = x + corr_applied
+            x = x - x.mean(dim=(-2, -1), keepdim=True) + x_mean
+
+        # --- Mode: stochastic (post-step -- structure-aware noise) ---
+        elif mode == 'stochastic' and eta_step > 1e-3:
+            if float(sigma_next) > 0:
+                noise = torch.randn_like(x)
+                # Detail-weighted: more noise where image has structure
+                ks = 5
+                pad = ks // 2
+                padded = F.pad(x, [pad] * 4, mode='reflect')
+                lowpass = F.avg_pool2d(padded, ks, stride=1)
+                detail_energy = (x - lowpass).abs()
+                detail_norm = detail_energy / detail_energy.mean().clamp(min=1e-8)
+                x = x + (eta_step * float(sigma_next) * _sde_s
+                          * noise * detail_norm)
+
+        # Update cross-step state for momentum mode
+        if mode == 'momentum':
+            denoised_prev = denoised_2_orig
 
         # NaN/inf guard
         if torch.isnan(x).any() or torch.isinf(x).any():
@@ -1433,88 +1504,84 @@ def _sample_hfx(
 
 # --- Experimental sampler wrappers (base, no strength suffix) ---
 
-def sample_hfx_lap(model, x, sigmas, extra_args=None, callback=None,
-                    disable=False):
-    """Laplacian pyramid multi-scale HFE (experimental)."""
-    LOGGER.info(">>> hfx_lap sampler invoked (%d sigmas)", len(sigmas))
+def sample_hfx_sharp(model, x, sigmas, extra_args=None, callback=None,
+                      disable=False):
+    """Unsharp mask on eps_2 -- amplifies model's fine-scale predictions."""
+    LOGGER.info(">>> hfx_sharp sampler invoked (%d sigmas)", len(sigmas))
     return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='lap')
+                       mode='sharp')
 
 
-def sample_hfx_mom(model, x, sigmas, extra_args=None, callback=None,
-                    disable=False):
-    """Correction momentum HFE (experimental)."""
-    LOGGER.info(">>> hfx_mom sampler invoked (%d sigmas)", len(sigmas))
+def sample_hfx_boost(model, x, sigmas, extra_args=None, callback=None,
+                      disable=False):
+    """Uniform eps_2 scaling (lying sigma) -- larger steps toward prediction."""
+    LOGGER.info(">>> hfx_boost sampler invoked (%d sigmas)", len(sigmas))
     return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='mom')
+                       mode='boost')
 
 
-def sample_hfx_fft(model, x, sigmas, extra_args=None, callback=None,
-                    disable=False):
-    """FFT spectral shaping HFE (experimental)."""
-    LOGGER.info(">>> hfx_fft sampler invoked (%d sigmas)", len(sigmas))
+def sample_hfx_detail(model, x, sigmas, extra_args=None, callback=None,
+                       disable=False):
+    """Post-step HF injection from denoised_2 -- recovers smoothed detail."""
+    LOGGER.info(">>> hfx_detail sampler invoked (%d sigmas)", len(sigmas))
     return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='fft')
+                       mode='detail')
 
 
-def sample_hfx_sde(model, x, sigmas, extra_args=None, callback=None,
-                    disable=False):
-    """Stochastic HF injection HFE (experimental)."""
-    LOGGER.info(">>> hfx_sde sampler invoked (%d sigmas)", len(sigmas))
-    return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='sde')
-
-
-def sample_hfx_spatial(model, x, sigmas, extra_args=None, callback=None,
-                        disable=False):
-    """Spatially-adaptive gating HFE (experimental)."""
-    LOGGER.info(">>> hfx_spatial sampler invoked (%d sigmas)", len(sigmas))
-    return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='spatial')
-
-
-# --- Hybrid sampler wrappers ---
-
-def sample_hfx_lap_mom(model, x, sigmas, extra_args=None, callback=None,
-                        disable=False):
-    """Laplacian pyramid + momentum HFE (experimental hybrid)."""
-    LOGGER.info(">>> hfx_lap_mom sampler invoked (%d sigmas)", len(sigmas))
-    return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='lap_mom')
-
-
-def sample_hfx_lap_spatial(model, x, sigmas, extra_args=None, callback=None,
+def sample_hfx_stochastic(model, x, sigmas, extra_args=None, callback=None,
                             disable=False):
-    """Laplacian pyramid + spatial gating HFE (experimental hybrid)."""
-    LOGGER.info(">>> hfx_lap_spatial sampler invoked (%d sigmas)", len(sigmas))
+    """Structure-aware noise injection -- non-deterministic variation."""
+    LOGGER.info(">>> hfx_stochastic sampler invoked (%d sigmas)", len(sigmas))
     return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='lap_spatial')
+                       mode='stochastic')
 
 
-def sample_hfx_fft_spatial(model, x, sigmas, extra_args=None, callback=None,
-                            disable=False):
-    """FFT spectral + spatial gating HFE (experimental hybrid)."""
-    LOGGER.info(">>> hfx_fft_spatial sampler invoked (%d sigmas)", len(sigmas))
-    return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='fft_spatial')
-
-
-# --- Band profile variants for hfx_lap ---
-
-def sample_hfx_lap_fine(model, x, sigmas, extra_args=None, callback=None,
+def sample_hfx_momentum(model, x, sigmas, extra_args=None, callback=None,
                          disable=False):
-    """Laplacian pyramid fine-detail emphasis (experimental)."""
-    LOGGER.info(">>> hfx_lap_fine sampler invoked (%d sigmas)", len(sigmas))
+    """Cross-step temporal EMA -- amplifies direction of prediction change."""
+    LOGGER.info(">>> hfx_momentum sampler invoked (%d sigmas)", len(sigmas))
     return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='lap', lap_weights=(2.5, 0.8, 0.2))
+                       mode='momentum')
 
 
-def sample_hfx_lap_broad(model, x, sigmas, extra_args=None, callback=None,
+def sample_hfx_spectral(model, x, sigmas, extra_args=None, callback=None,
+                          disable=False):
+    """FFT frequency reshaping -- power-law spectral boost on eps_2."""
+    LOGGER.info(">>> hfx_spectral sampler invoked (%d sigmas)", len(sigmas))
+    return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
+                       mode='spectral')
+
+
+def sample_hfx_orthogonal(model, x, sigmas, extra_args=None, callback=None,
+                            disable=False):
+    """Gram-Schmidt projection -- amplifies novel info from stage 2."""
+    LOGGER.info(">>> hfx_orthogonal sampler invoked (%d sigmas)", len(sigmas))
+    return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
+                       mode='orthogonal')
+
+
+def sample_hfx_refine(model, x, sigmas, extra_args=None, callback=None,
+                       disable=False):
+    """ODE curvature-adaptive emphasis -- amplifies where integrator is least accurate."""
+    LOGGER.info(">>> hfx_refine sampler invoked (%d sigmas)", len(sigmas))
+    return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
+                       mode='refine')
+
+
+def sample_hfx_focus(model, x, sigmas, extra_args=None, callback=None,
+                      disable=False):
+    """Value-domain power-law contrast -- amplifies dominant corrections."""
+    LOGGER.info(">>> hfx_focus sampler invoked (%d sigmas)", len(sigmas))
+    return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
+                       mode='focus')
+
+
+def sample_hfx_coherence(model, x, sigmas, extra_args=None, callback=None,
                            disable=False):
-    """Laplacian pyramid broad/even emphasis (experimental)."""
-    LOGGER.info(">>> hfx_lap_broad sampler invoked (%d sigmas)", len(sigmas))
+    """Inter-stage phase coherence gating -- trusts structurally confident frequencies."""
+    LOGGER.info(">>> hfx_coherence sampler invoked (%d sigmas)", len(sigmas))
     return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='lap', lap_weights=(1.0, 1.2, 1.0))
+                       mode='coherence')
 
 
 # =====================================================================
@@ -1528,25 +1595,45 @@ _HFX_LEVELS = 4
 
 # Per-mode sweep definitions: (mode, param_name, values_s1_to_s4)
 _HFX_SWEEPS = {
-    'lap': {
+    'sharp': {
         'param': 'eta',
-        'values': (0.10, 0.20, 0.35, 0.50),
+        'values': (0.10, 0.30, 0.70, 1.50),
     },
-    'mom': {
-        'param': 'mom_beta',
-        'values': (0.40, 0.55, 0.70, 0.85),
+    'boost': {
+        'param': 'boost_factor',
+        'values': (0.2, 0.6, 1.2, 2.5),
     },
-    'fft': {
-        'param': 'fft_cutoff',
-        'values': (0.15, 0.25, 0.35, 0.45),
+    'detail': {
+        'param': 'eta',
+        'values': (0.10, 0.30, 0.70, 1.50),
     },
-    'sde': {
+    'stochastic': {
         'param': 'sde_strength',
-        'values': (0.03, 0.06, 0.10, 0.15),
+        'values': (0.03, 0.10, 0.25, 0.50),
     },
-    'spatial': {
+    'momentum': {
+        'param': 'momentum_strength',
+        'values': (0.15, 0.50, 1.00, 2.00),
+    },
+    'spectral': {
+        'param': 'spectral_alpha',
+        'values': (0.3, 0.8, 1.5, 2.5),
+    },
+    'orthogonal': {
         'param': 'eta',
-        'values': (0.10, 0.20, 0.35, 0.50),
+        'values': (0.10, 0.30, 0.70, 1.50),
+    },
+    'refine': {
+        'param': 'eta',
+        'values': (0.10, 0.30, 0.70, 1.50),
+    },
+    'focus': {
+        'param': 'focus_gamma',
+        'values': (0.4, 1.0, 1.8, 3.0),
+    },
+    'coherence': {
+        'param': 'eta',
+        'values': (0.10, 0.30, 0.70, 1.50),
     },
 }
 
@@ -1776,19 +1863,17 @@ _SAMPLERS["hfe_auto"] = sample_hfe_auto     # 2-stage adaptive
 _SAMPLERS["hfe3_auto"] = sample_hfe3_auto   # 3-stage adaptive
 _SAMPLERS["hfe4_auto"] = sample_hfe4_auto   # 4-stage adaptive
 _SAMPLERS["hfe5_auto"] = sample_hfe5_auto   # 5-stage adaptive
-# Experimental base samplers
-_SAMPLERS["hfx_lap"] = sample_hfx_lap
-_SAMPLERS["hfx_mom"] = sample_hfx_mom
-_SAMPLERS["hfx_fft"] = sample_hfx_fft
-_SAMPLERS["hfx_sde"] = sample_hfx_sde
-_SAMPLERS["hfx_spatial"] = sample_hfx_spatial
-# Hybrid combinators
-_SAMPLERS["hfx_lap_mom"] = sample_hfx_lap_mom
-_SAMPLERS["hfx_lap_spatial"] = sample_hfx_lap_spatial
-_SAMPLERS["hfx_fft_spatial"] = sample_hfx_fft_spatial
-# Band profile variants
-_SAMPLERS["hfx_lap_fine"] = sample_hfx_lap_fine
-_SAMPLERS["hfx_lap_broad"] = sample_hfx_lap_broad
+# Experimental base samplers (10 fundamentally different modes)
+_SAMPLERS["hfx_sharp"] = sample_hfx_sharp
+_SAMPLERS["hfx_boost"] = sample_hfx_boost
+_SAMPLERS["hfx_detail"] = sample_hfx_detail
+_SAMPLERS["hfx_stochastic"] = sample_hfx_stochastic
+_SAMPLERS["hfx_momentum"] = sample_hfx_momentum
+_SAMPLERS["hfx_spectral"] = sample_hfx_spectral
+_SAMPLERS["hfx_orthogonal"] = sample_hfx_orthogonal
+_SAMPLERS["hfx_refine"] = sample_hfx_refine
+_SAMPLERS["hfx_focus"] = sample_hfx_focus
+_SAMPLERS["hfx_coherence"] = sample_hfx_coherence
 # Graduated experimental presets (hfx_*_s1..s4 for each mode)
 _SAMPLERS.update(_HFX_PRESETS)
 
@@ -1807,6 +1892,16 @@ _OLD_NAMES = [
     "res_2s_soft", "res_2s_sharp", "res_2s_crisp",
     "tangent_soft", "tangent_sharp", "tangent_crisp",
     "hfe_soft", "hfe_sharp", "hfe_crisp",
+    # Old experimental modes (replaced by sharp/boost/detail/stochastic)
+    "hfx_lap", "hfx_mom", "hfx_fft", "hfx_sde", "hfx_spatial",
+    "hfx_lap_mom", "hfx_lap_spatial", "hfx_fft_spatial",
+    "hfx_lap_fine", "hfx_lap_broad",
+    # Old graduated presets
+    "hfx_lap_s1", "hfx_lap_s2", "hfx_lap_s3", "hfx_lap_s4",
+    "hfx_mom_s1", "hfx_mom_s2", "hfx_mom_s3", "hfx_mom_s4",
+    "hfx_fft_s1", "hfx_fft_s2", "hfx_fft_s3", "hfx_fft_s4",
+    "hfx_sde_s1", "hfx_sde_s2", "hfx_sde_s3", "hfx_sde_s4",
+    "hfx_spatial_s1", "hfx_spatial_s2", "hfx_spatial_s3", "hfx_spatial_s4",
 ]
 
 
