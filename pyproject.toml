@@ -1,6 +1,6 @@
 [project]
 name = "RES4SHO"
-version = "1.1.1"
+version = "1.1.4"
 description = "High-Frequency Detail Sampling based on Res Sampling for ComfyUI"
 readme = "README.md"
 requires-python = ">=3.10"
