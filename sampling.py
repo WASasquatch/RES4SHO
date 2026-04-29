@@ -122,19 +122,43 @@ def _clamp_boost(boost: torch.Tensor, eps: torch.Tensor,
     return boost
 
 
+def _ensure_4d(t: torch.Tensor):
+    """Fold [B,C,T,H,W] -> [B*T,C,H,W] for 2D spatial ops.
+
+    Returns (folded_tensor, unfold_function).
+    For 4D input, returns (t, identity).
+    """
+    if t.ndim == 5:
+        B, C, T, H, W = t.shape
+        return t.reshape(B * T, C, H, W), lambda x: x.reshape(B, C, T, x.shape[-2], x.shape[-1])
+    return t, lambda x: x
+
+
+def _spatial_lowpass(t: torch.Tensor, kernel_size: int = 5) -> torch.Tensor:
+    """Box-blur lowpass that handles 3D [B,C,N], 4D [B,C,H,W], and 5D [B,C,T,H,W]."""
+    pad = kernel_size // 2
+    if t.ndim == 5:
+        t_4d, unfold = _ensure_4d(t)
+        return unfold(_spatial_lowpass(t_4d, kernel_size))
+    if t.ndim == 4:
+        padded = F.pad(t, [pad] * 4, mode='reflect')
+        return F.avg_pool2d(padded, kernel_size, stride=1)
+    if t.ndim == 3:
+        padded = F.pad(t, [pad, pad], mode='reflect')
+        return F.avg_pool1d(padded, kernel_size, stride=1)
+    return t
+
+
 def _extract_hf(t: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
     """
     Spatial high-pass via residual after box blur.
 
-    For a 4D [B,C,H,W] latent tensor this isolates edges, texture, and
-    micro-structure.  Returns zeros for non-4D inputs.
+    Handles 3D [B,C,N], 4D [B,C,H,W], and 5D [B,C,T,H,W] latent tensors.
+    Returns zeros for other shapes.
     """
-    if t.ndim != 4:
+    if t.ndim not in (3, 4, 5):
         return torch.zeros_like(t)
-    pad = kernel_size // 2
-    padded = F.pad(t, [pad, pad, pad, pad], mode='reflect')
-    low = F.avg_pool2d(padded, kernel_size, stride=1)
-    return t - low
+    return t - _spatial_lowpass(t, kernel_size)
 
 
 # =====================================================================
@@ -1366,11 +1390,7 @@ def _sample_hfx(
 
         # --- Mode: sharp (inside integrator -- modify eps_2) ---
         if mode == 'sharp' and eta_step > 1e-3:
-            ks = 5
-            pad = ks // 2
-            padded = F.pad(eps_2, [pad] * 4, mode='reflect')
-            lowpass = F.avg_pool2d(padded, ks, stride=1)
-            highpass = eps_2 - lowpass
+            highpass = eps_2 - _spatial_lowpass(eps_2, kernel_size=5)
             eps_2 = eps_2 + eta_step * 3.0 * highpass
 
         # --- Mode: boost (inside integrator -- scale eps_2) ---
@@ -1379,15 +1399,24 @@ def _sample_hfx(
 
         # --- Mode: spectral (inside integrator -- FFT frequency reshaping) ---
         elif mode == 'spectral' and eta_step > 1e-3:
-            h_dim, w_dim = eps_2.shape[-2], eps_2.shape[-1]
-            eps_fft = torch.fft.rfft2(eps_2)
-            y_freq = torch.fft.fftfreq(h_dim, device=eps_2.device)
-            x_freq = torch.fft.rfftfreq(w_dim, device=eps_2.device)
-            freq = torch.sqrt(y_freq[:, None] ** 2 + x_freq[None, :] ** 2).clamp(min=1e-10)
-            boost = freq.pow(_spectral_a)
-            boost = boost / boost.mean()
-            eps_fft = eps_fft * (1.0 + eta_step * (boost - 1.0))
-            eps_2 = torch.fft.irfft2(eps_fft, s=(h_dim, w_dim))
+            if eps_2.ndim >= 4:
+                h_dim, w_dim = eps_2.shape[-2], eps_2.shape[-1]
+                eps_fft = torch.fft.rfft2(eps_2)
+                y_freq = torch.fft.fftfreq(h_dim, device=eps_2.device)
+                x_freq = torch.fft.rfftfreq(w_dim, device=eps_2.device)
+                freq = torch.sqrt(y_freq[:, None] ** 2 + x_freq[None, :] ** 2).clamp(min=1e-10)
+                boost = freq.pow(_spectral_a)
+                boost = boost / boost.mean()
+                eps_fft = eps_fft * (1.0 + eta_step * (boost - 1.0))
+                eps_2 = torch.fft.irfft2(eps_fft, s=(h_dim, w_dim))
+            else:
+                n_dim = eps_2.shape[-1]
+                eps_fft = torch.fft.rfft(eps_2)
+                freq = torch.fft.rfftfreq(n_dim, device=eps_2.device).clamp(min=1e-10)
+                boost = freq.pow(_spectral_a)
+                boost = boost / boost.mean()
+                eps_fft = eps_fft * (1.0 + eta_step * (boost - 1.0))
+                eps_2 = torch.fft.irfft(eps_fft, n=n_dim)
 
         # --- Mode: orthogonal (inside integrator -- Gram-Schmidt) ---
         elif mode == 'orthogonal' and eta_step > 1e-3:
@@ -1402,10 +1431,7 @@ def _sample_hfx(
         # --- Mode: refine (inside integrator -- ODE curvature-adaptive) ---
         elif mode == 'refine' and eta_step > 1e-3:
             curvature = (eps_2 - eps_1).abs()
-            ks = 5
-            pad = ks // 2
-            padded = F.pad(curvature, [pad] * 4, mode='reflect')
-            curvature_smooth = F.avg_pool2d(padded, ks, stride=1)
+            curvature_smooth = _spatial_lowpass(curvature, kernel_size=5)
             curvature_norm = curvature_smooth / curvature_smooth.mean().clamp(min=1e-8)
             eps_2 = eps_2 * (1.0 + eta_step * (curvature_norm - 1.0))
 
@@ -1419,13 +1445,22 @@ def _sample_hfx(
 
         # --- Mode: coherence (inside integrator -- phase coherence gating) ---
         elif mode == 'coherence' and eta_step > 1e-3:
-            h_dim, w_dim = eps_2.shape[-2], eps_2.shape[-1]
-            e1_fft = torch.fft.rfft2(eps_1)
-            e2_fft = torch.fft.rfft2(eps_2)
-            phase_diff = torch.angle(e2_fft * e1_fft.conj())
-            coh = torch.cos(phase_diff)
-            gate = 1.0 + eta_step * coh
-            eps_2 = torch.fft.irfft2(e2_fft * gate, s=(h_dim, w_dim))
+            if eps_2.ndim >= 4:
+                h_dim, w_dim = eps_2.shape[-2], eps_2.shape[-1]
+                e1_fft = torch.fft.rfft2(eps_1)
+                e2_fft = torch.fft.rfft2(eps_2)
+                phase_diff = torch.angle(e2_fft * e1_fft.conj())
+                coh = torch.cos(phase_diff)
+                gate = 1.0 + eta_step * coh
+                eps_2 = torch.fft.irfft2(e2_fft * gate, s=(h_dim, w_dim))
+            else:
+                n_dim = eps_2.shape[-1]
+                e1_fft = torch.fft.rfft(eps_1)
+                e2_fft = torch.fft.rfft(eps_2)
+                phase_diff = torch.angle(e2_fft * e1_fft.conj())
+                coh = torch.cos(phase_diff)
+                gate = 1.0 + eta_step * coh
+                eps_2 = torch.fft.irfft(e2_fft * gate, n=n_dim)
 
         # --- Per-step safety cap on eps_2 modification ---
         # Prevents compounding across steps from corrupting colors/structure.
@@ -1446,11 +1481,7 @@ def _sample_hfx(
 
         # --- Mode: detail (post-step -- inject HF from denoised_2) ---
         if mode == 'detail' and eta_step > 1e-3:
-            ks = 5
-            pad = ks // 2
-            padded = F.pad(denoised_2, [pad] * 4, mode='reflect')
-            lowpass = F.avg_pool2d(padded, ks, stride=1)
-            hf = denoised_2 - lowpass
+            hf = denoised_2 - _spatial_lowpass(denoised_2, kernel_size=5)
             sigma_scale = float(sigma)
             corr_applied = eta_step * _denoise_gate * sigma_scale * hf
 
@@ -1461,21 +1492,18 @@ def _sample_hfx(
             if _ca_rms > _cap:
                 corr_applied = corr_applied * (_cap / _ca_rms)
 
-            # Apply with mean preservation
-            x_mean = x.mean(dim=(-2, -1), keepdim=True)
+            # Apply with mean preservation (spatial dims only)
+            _spatial_dims = tuple(range(2, x.ndim))
+            x_mean = x.mean(dim=_spatial_dims, keepdim=True)
             x = x + corr_applied
-            x = x - x.mean(dim=(-2, -1), keepdim=True) + x_mean
+            x = x - x.mean(dim=_spatial_dims, keepdim=True) + x_mean
 
         # --- Mode: stochastic (post-step -- structure-aware noise) ---
         elif mode == 'stochastic' and eta_step > 1e-3:
             if float(sigma_next) > 0:
                 noise = torch.randn_like(x)
                 # Detail-weighted: more noise where image has structure
-                ks = 5
-                pad = ks // 2
-                padded = F.pad(x, [pad] * 4, mode='reflect')
-                lowpass = F.avg_pool2d(padded, ks, stride=1)
-                detail_energy = (x - lowpass).abs()
+                detail_energy = (x - _spatial_lowpass(x, kernel_size=5)).abs()
                 detail_norm = detail_energy / detail_energy.mean().clamp(min=1e-8)
                 x = x + (eta_step * float(sigma_next) * _sde_s
                           * noise * detail_norm)
@@ -1691,6 +1719,7 @@ def _tangent_sigmas(
     sigma_min: float,
     slope: float,
     pivot_frac: float,
+    rho: float = 7.0,
 ) -> torch.Tensor:
     n = steps
     if n < 1:
@@ -1711,7 +1740,12 @@ def _tangent_sigmas(
     else:
         normalized = (raw - r_min) / r_range
 
-    sigmas = normalized * (sigma_max - sigma_min) + sigma_min
+    # Karras power-law spacing: interpolate in sigma^(1/rho) space
+    inv_rho = 1.0 / rho
+    lo = sigma_min ** inv_rho
+    hi = sigma_max ** inv_rho
+    sigmas = (lo + normalized * (hi - lo)) ** rho
+
     sigmas = torch.cat([sigmas, torch.zeros(1, dtype=torch.float64)])
     return sigmas.float()
 
@@ -1805,6 +1839,7 @@ def _logistic_sigmas(
     sigma_min: float,
     steepness: float = 8.0,
     midpoint: float = 0.4,
+    rho: float = 7.0,
 ) -> torch.Tensor:
     """
     Logistic (sigmoid) S-curve schedule.
@@ -1830,7 +1865,12 @@ def _logistic_sigmas(
     else:
         normalized = (raw - r_min) / r_range
 
-    sigmas = normalized * (sigma_max - sigma_min) + sigma_min
+    # Karras power-law spacing: interpolate in sigma^(1/rho) space
+    inv_rho = 1.0 / rho
+    lo = sigma_min ** inv_rho
+    hi = sigma_max ** inv_rho
+    sigmas = (lo + normalized * (hi - lo)) ** rho
+
     sigmas = torch.cat([sigmas, torch.zeros(1, dtype=torch.float64)])
     return sigmas.float()
 

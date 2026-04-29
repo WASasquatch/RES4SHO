@@ -50,26 +50,44 @@ Per-step adaptive `eta` based on sigma envelope and content gating:
 
 ### Experimental Samplers (hfx_*)
 
-Alternative HF extraction methods, all using a 2-stage base:
+10 fundamentally different enhancement modes, each operating in a distinct mathematical domain. All use a 2-stage exponential integrator base.
 
-| Sampler | Method |
-|---------|--------|
-| `hfx_lap` | Laplacian pyramid multi-scale (3 bands) |
-| `hfx_mom` | Correction momentum (EMA across steps) |
-| `hfx_fft` | FFT spectral high-pass with smooth cutoff |
-| `hfx_sde` | Stochastic HF noise injection |
-| `hfx_spatial` | Spatially-adaptive per-pixel gating |
+#### Spatial Domain
 
-**Hybrids** (combine two techniques):
-- `hfx_lap_mom` -- Laplacian pyramid + momentum
-- `hfx_lap_spatial` -- Laplacian pyramid + spatial gating
-- `hfx_fft_spatial` -- FFT spectral + spatial gating
+| Sampler | Method | Description |
+|---------|--------|-------------|
+| `hfx_sharp` | Spatial high-pass | Unsharp mask on eps_2 via 3x3 box blur residual |
+| `hfx_detail` | Post-step injection | Extracts HF from denoised_2, injects after the integrator step |
 
-**Band profile variants:**
-- `hfx_lap_fine` -- fine-detail emphasis (edges, texture)
-- `hfx_lap_broad` -- even emphasis across frequency bands
+#### Value Domain
 
-Each experimental mode also has 4 graduated strength presets (`_s1` .. `_s4`), e.g. `hfx_lap_s1`, `hfx_mom_s3`, etc.
+| Sampler | Method | Description |
+|---------|--------|-------------|
+| `hfx_boost` | Uniform scalar | Amplifies eps_2 magnitude uniformly (effective "lying sigma") |
+| `hfx_focus` | Power-law contrast | Nonlinear gamma curve on eps_2 element magnitudes -- large corrections amplified, small corrections unchanged |
+
+#### Frequency Domain
+
+| Sampler | Method | Description |
+|---------|--------|-------------|
+| `hfx_spectral` | FFT power-law | Reshapes eps_2 frequency spectrum with distance-based power-law boost |
+| `hfx_coherence` | FFT phase gating | Amplifies frequency bins where eps_1 and eps_2 agree in phase; suppresses where they disagree |
+
+#### Temporal Domain
+
+| Sampler | Method | Description |
+|---------|--------|-------------|
+| `hfx_momentum` | EMA across steps | Accumulates denoised differences across steps via exponential moving average |
+| `hfx_stochastic` | SDE noise injection | Adds scaled noise proportional to local HF content -- non-deterministic |
+
+#### Inter-Stage / Geometric Domain
+
+| Sampler | Method | Description |
+|---------|--------|-------------|
+| `hfx_orthogonal` | Gram-Schmidt projection | Extracts the component of eps_2 orthogonal to eps_1 (novel information only) |
+| `hfx_refine` | ODE curvature map | Uses |eps_2 - eps_1| as a spatial attention mask -- amplifies where the ODE has highest local truncation error |
+
+Each mode has 4 graduated strength presets (`_s1` .. `_s4`), e.g. `hfx_sharp_s1`, `hfx_spectral_s3`, `hfx_refine_s4`, etc. A per-step safety cap prevents compounding artifacts at higher strengths.
 
 ## Schedulers
 
@@ -103,8 +121,8 @@ An ASCII sigma chart is printed to the console when a scheduler is used.
 | Portraits / faces | `hfe_auto` | `atan_focused` | Auto gate protects smooth skin while sharpening eyes, hair, pores |
 | Landscapes / nature | `hfe_s5` | `atan_gentle` | Fixed mid-strength avoids over-enhancing skies and gradients |
 | Architecture / hard surfaces | `hfe_s7` | `atan_steep` | Strong emphasis on edges and geometric detail |
-| Text / UI renders | `hfx_lap_fine` | `atan_steep` | Fine-band Laplacian targets glyph edges specifically |
-| Fabric / organic texture | `hfx_lap_broad` | `atan_focused` | Even multi-scale emphasis across weave and folds |
+| Text / UI renders | `hfx_sharp` | `atan_steep` | Spatial high-pass targets glyph edges specifically |
+| Fabric / organic texture | `hfx_spectral` | `atan_focused` | Frequency-domain emphasis across texture scales |
 | Illustrations / anime | `hfe_s4` | `atan_gentle` | Light emphasis preserves flat shading without adding unwanted texture |
 
 ### High-Accuracy Integrators
@@ -123,14 +141,16 @@ More model evaluations per step for better ODE integration -- useful at low step
 
 | Sampler | Scheduler | Character |
 |---------|-----------|-----------|
-| `hfx_lap` | `atan_focused` | Multi-scale detail -- good default experimental choice |
-| `hfx_fft` | `atan_steep` | Frequency-domain sharpening -- clean spectral separation |
-| `hfx_spatial` | `atan_focused` | Sharpens high-variance regions, leaves smooth areas alone |
-| `hfx_mom` | `atan_gentle` | Accumulates detail across steps -- builds up gradually |
-| `hfx_sde` | `atan_gentle` | Stochastic texture injection -- adds micro-variation |
-| `hfx_lap_mom` | `atan_focused` | Multi-scale + momentum -- rich progressive detail |
-| `hfx_lap_spatial` | `atan_steep` | Multi-scale + spatial gating -- targeted sharpening |
-| `hfx_fft_spatial` | `atan_focused` | Spectral + spatial -- precise frequency-aware gating |
+| `hfx_sharp` | `atan_focused` | Spatial high-pass -- good default experimental choice |
+| `hfx_spectral` | `atan_steep` | Frequency-domain power-law sharpening |
+| `hfx_refine` | `atan_focused` | ODE curvature-adaptive -- sharpens where the model is least certain |
+| `hfx_coherence` | `atan_focused` | Phase-coherence gating -- amplifies structurally confident frequencies |
+| `hfx_orthogonal` | `atan_focused` | Novel-information extraction via Gram-Schmidt |
+| `hfx_momentum` | `atan_gentle` | Temporal accumulation -- builds detail across steps |
+| `hfx_focus` | `atan_focused` | Value-domain contrast -- amplifies dominant correction directions |
+| `hfx_stochastic` | `atan_gentle` | Stochastic texture injection -- adds micro-variation |
+| `hfx_boost` | `atan_gentle` | Uniform eps amplification -- simple signal boost |
+| `hfx_detail` | `atan_focused` | Post-step HF injection from denoised output |
 
 ### Scheduler Pairings
 
@@ -146,9 +166,19 @@ More model evaluations per step for better ODE integration -- useful at low step
 
 **Base integrator:** Multi-stage singlestep exponential integrator (res_Ns) with phi-function coefficients, giving exact treatment of exponential decay and higher-order corrections from intermediate evaluations.
 
-**HFE enhancement:** The inter-stage correction delta captures what the model reveals at lower noise -- texture, edges, micro-structure. A spatial high-pass (residual after box blur in latent space) extracts the fine detail component, which is re-injected with extra weight `eta`. This compounds across every step.
+**HFE enhancement (hfe_\* samplers):** The inter-stage correction delta captures what the model reveals at lower noise -- texture, edges, micro-structure. A spatial high-pass (residual after box blur in latent space) extracts the fine detail component, which is re-injected with extra weight `eta`. This compounds across every step.
 
-**Cost:** One 3x3 `avg_pool` per step for all variants (negligible vs. model evaluation). Auto samplers add a few scalar ops on top.
+**HFX modes (hfx_\* samplers):** Each mode modifies the second-stage prediction (`eps_2`) using a different mathematical operation before the integrator update step. The 10 modes span 5 domains:
+
+- **Spatial:** high-pass filtering (sharp), post-step HF injection (detail)
+- **Value:** uniform scaling (boost), nonlinear power-law contrast (focus)
+- **Frequency:** FFT power-law reshaping (spectral), inter-stage phase coherence gating (coherence)
+- **Temporal:** EMA across steps (momentum), stochastic noise injection (stochastic)
+- **Inter-stage:** Gram-Schmidt novel-component extraction (orthogonal), ODE curvature-adaptive gain (refine)
+
+**Safety:** A per-step cap limits eps_2 modifications to 10% of the original RMS, preventing compounding artifacts across steps. A sigma warmup gate suppresses all enhancement at high noise levels (early steps). An img2img denoise gate scales down enhancement for partial-denoise schedules.
+
+**Cost:** One 3x3 `avg_pool` per step for spatial variants; one FFT pair for spectral/coherence modes. All negligible vs. model evaluation. Auto samplers add a few scalar ops on top.
 
 ## License
 
