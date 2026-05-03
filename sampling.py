@@ -467,12 +467,74 @@ def _sample_hfe_auto(
     return x
 
 
-def sample_hfe_auto(model, x, sigmas, extra_args=None, callback=None, disable=False):
-    """Adaptive HFE -- variable c2, eta, and kernel per step."""
-    LOGGER.info(">>> hfe_auto sampler invoked (%d sigmas)", len(sigmas))
-    return _sample_hfe_auto(
+# ---------------------------------------------------------------------
+# Stage-count dispatch -- the multi-stage integrator cores are kept as
+# distinct functions because each has its own Butcher tableau; this
+# dispatcher routes a single user-facing sampler to the right core
+# based on the requested *stages* count. Default eta values per stage
+# come from the calibrated per-stage tunings (mirrors the old hfe_auto
+# / hfe3_auto / hfe4_auto / hfe5_auto presets).
+# ---------------------------------------------------------------------
+
+_HFE_AUTO_DEFAULT_ETA = {2: 0.55, 3: 0.275, 4: 0.183, 5: 0.138}
+_HFE_FIXED_STAGE_SCALE = {2: 1.0, 3: 1.0 / 2, 4: 1.0 / 3, 5: 1.0 / 4}
+
+
+def _dispatch_hfe(model, x, sigmas, extra_args, callback, disable,
+                  *, stages: int, eta: float, c2: float = 0.5):
+    """Pick the right fixed-eta integrator core for the requested stages.
+    *eta* and *c2* are the user-supplied knobs; only *c2* is honored on
+    the 2-stage core (the 3/4/5-stage cores have fixed Butcher tableau).
+    """
+    s = max(2, min(5, int(stages)))
+    if s == 2:
+        return _sample_hfe(model, x, sigmas, extra_args, callback, disable,
+                           c2=c2, eta=eta)
+    if s == 3:
+        return _sample_hfe_3s(model, x, sigmas, extra_args, callback, disable,
+                              eta=eta)
+    if s == 4:
+        return _sample_hfe_4s(model, x, sigmas, extra_args, callback, disable,
+                              eta=eta)
+    return _sample_hfe_5s(model, x, sigmas, extra_args, callback, disable,
+                          eta=eta)
+
+
+def _dispatch_hfe_auto(model, x, sigmas, extra_args, callback, disable,
+                       *, stages: int, eta: float,
+                       c2_start: float = 0.45, c2_end: float = 0.85):
+    s = max(2, min(5, int(stages)))
+    if s == 2:
+        return _sample_hfe_auto(model, x, sigmas, extra_args, callback,
+                                disable, eta_peak=eta,
+                                c2_start=c2_start, c2_end=c2_end)
+    if s == 3:
+        return _sample_hfe_3s_auto(model, x, sigmas, extra_args, callback,
+                                   disable, eta_peak=eta)
+    if s == 4:
+        return _sample_hfe_4s_auto(model, x, sigmas, extra_args, callback,
+                                   disable, eta_peak=eta)
+    return _sample_hfe_5s_auto(model, x, sigmas, extra_args, callback,
+                               disable, eta_peak=eta)
+
+
+def sample_hfe_auto(model, x, sigmas, extra_args=None, callback=None, disable=False,
+                    stages: int = 2,
+                    eta: float = -1.0,
+                    c2_start: float = 0.45, c2_end: float = 0.85):
+    """Adaptive HFE -- variable c2, eta, and kernel per step.
+
+    *stages* selects the underlying exponential-integrator order (2..5).
+    *eta* maps to the per-stage peak HF amplification; pass < 0 to use
+    the calibrated default for the chosen stage count.
+    """
+    if eta < 0:
+        eta = _HFE_AUTO_DEFAULT_ETA.get(int(stages), 0.55)
+    LOGGER.info(">>> hfe_auto sampler invoked (%d sigmas, stages=%d, eta=%.3f)",
+                len(sigmas), int(stages), eta)
+    return _dispatch_hfe_auto(
         model, x, sigmas, extra_args, callback, disable,
-        eta_peak=0.55, c2_start=0.45, c2_end=0.85,
+        stages=stages, eta=eta, c2_start=c2_start, c2_end=c2_end,
     )
 
 
@@ -682,11 +744,8 @@ def _sample_hfe_3s_auto(
     return x
 
 
-def sample_hfe3_auto(model, x, sigmas, extra_args=None, callback=None, disable=False):
-    """3-stage adaptive HFE."""
-    LOGGER.info(">>> hfe3_auto sampler invoked (%d sigmas)", len(sigmas))
-    return _sample_hfe_3s_auto(model, x, sigmas, extra_args, callback, disable,
-                               eta_peak=0.275)
+# sample_hfe3_auto / hfe4_auto / hfe5_auto have been folded into
+# sample_hfe_auto(stages=N) -- pick the stage count via ManualSampler.
 
 
 # =====================================================================
@@ -916,11 +975,7 @@ def _sample_hfe_4s_auto(
     return x
 
 
-def sample_hfe4_auto(model, x, sigmas, extra_args=None, callback=None, disable=False):
-    """4-stage adaptive HFE."""
-    LOGGER.info(">>> hfe4_auto sampler invoked (%d sigmas)", len(sigmas))
-    return _sample_hfe_4s_auto(model, x, sigmas, extra_args, callback, disable,
-                               eta_peak=0.183)
+# sample_hfe4_auto folded into sample_hfe_auto(stages=4).
 
 
 # =====================================================================
@@ -1178,11 +1233,7 @@ def _sample_hfe_5s_auto(
     return x
 
 
-def sample_hfe5_auto(model, x, sigmas, extra_args=None, callback=None, disable=False):
-    """5-stage adaptive HFE."""
-    LOGGER.info(">>> hfe5_auto sampler invoked (%d sigmas)", len(sigmas))
-    return _sample_hfe_5s_auto(model, x, sigmas, extra_args, callback, disable,
-                               eta_peak=0.138)
+# sample_hfe5_auto folded into sample_hfe_auto(stages=5).
 
 
 # =====================================================================
@@ -1210,48 +1261,58 @@ _STAGE_CORES = {
 }
 
 
-def _make_hfe_preset(level: int, stages: int = 2):
-    """Factory: create a fixed-strength HFE sampler for the given level and stage count."""
-    core_fn, prefix = _STAGE_CORES[stages]
+def _make_hfe_preset(level: int):
+    """Factory: a 2-stage strength preset (hfe_s<level>).
+
+    Each preset has a calibrated default ``eta`` and ``c2`` matching the
+    historical s1..s8 levels, but both knobs (plus ``stages``, 2..5) are
+    overridable kwargs so ManualSampler / extra_options can dial the
+    same shape up to a higher-order integrator at runtime.
+    """
     t = level / (_HFE_LEVELS - 1)
-    eta = _HFE_ETA_MAX * (t ** 1.5)
-    # Compensate: higher stage counts produce larger inter-stage deltas,
-    # so the same eta hits much harder.  Scale inversely with stages.
-    if stages > 2:
-        eta = eta / (stages - 1)
+    eta_default = _HFE_ETA_MAX * (t ** 1.5)
+    c2_default = _HFE_C2_MIN + t * (_HFE_C2_MAX - _HFE_C2_MIN)
 
-    if stages == 2:
-        # 2-stage: also vary c2
-        c2 = _HFE_C2_MIN + t * (_HFE_C2_MAX - _HFE_C2_MIN)
-        def sampler(model, x, sigmas, extra_args=None, callback=None, disable=False,
-                    _c2=c2, _eta=eta):
-            return core_fn(model, x, sigmas, extra_args, callback, disable,
-                           c2=_c2, eta=_eta)
-        sampler.__doc__ = (f"HFE {stages}s strength {level + 1}/{_HFE_LEVELS}"
-                           f" -- c2={c2:.3f}, eta={eta:.3f}")
-    else:
-        # 3/4/5-stage: fixed c values, only vary eta
-        def sampler(model, x, sigmas, extra_args=None, callback=None, disable=False,
-                    _eta=eta, _prefix=prefix, _level=level):
-            LOGGER.info(">>> %s_s%d preset invoked, passing eta=%.4f",
-                        _prefix, _level + 1, _eta)
-            return core_fn(model, x, sigmas, extra_args, callback, disable,
-                           eta=_eta)
-        sampler.__doc__ = (f"HFE {stages}s strength {level + 1}/{_HFE_LEVELS}"
-                           f" -- eta={eta:.3f}")
+    # Negative-value sentinel keeps "user provided eta" distinguishable
+    # from "use the calibrated default". Without it, a Manual Sampler
+    # call like hfe_s4(stages=4, eta=0.5) would get its eta silently
+    # divided by (stages-1).
+    def sampler(model, x, sigmas, extra_args=None, callback=None, disable=False,
+                stages: int = 2,
+                eta: float = -1.0,
+                c2: float = -1.0):
+        using_eta_default = eta < 0
+        using_c2_default = c2 < 0
+        actual_eta = eta_default if using_eta_default else eta
+        actual_c2 = c2_default if using_c2_default else c2
+        # Auto-scale eta only when the caller is taking the preset default
+        # AND dialing stages above 2 -- preserves the original per-stage
+        # calibration. User-supplied eta is taken at face value.
+        if using_eta_default and int(stages) > 2:
+            actual_eta = actual_eta * _HFE_FIXED_STAGE_SCALE.get(
+                int(stages), 1.0)
+        LOGGER.info(">>> hfe_s%d preset invoked (stages=%d, eta=%.4f%s)",
+                    level + 1, int(stages), actual_eta,
+                    " [default-scaled]" if using_eta_default and int(stages) > 2
+                    else "")
+        return _dispatch_hfe(model, x, sigmas, extra_args, callback, disable,
+                             stages=stages, eta=actual_eta, c2=actual_c2)
 
-    name = f"{prefix}_s{level + 1}"
+    sampler.__doc__ = (f"HFE strength {level + 1}/{_HFE_LEVELS}"
+                       f" -- default eta={eta_default:.3f}, c2={c2_default:.3f}, "
+                       f"stages=2..5 via ManualSampler")
+    name = f"hfe_s{level + 1}"
     sampler.__name__ = f"sample_{name}"
     sampler.__qualname__ = sampler.__name__
     return name, sampler
 
 
-# Generate all presets: hfe_s1..s8, hfe3_s1..s8, hfe4_s1..s8, hfe5_s1..s8
+# Generate just the 8 strength presets (2-stage by default; users dial
+# stages 2..5 via ManualSampler -- see "stages" kwarg).
 _HFE_PRESETS = {}
-for _stages in (2, 3, 4, 5):
-    for _lvl in range(_HFE_LEVELS):
-        _name, _fn = _make_hfe_preset(_lvl, _stages)
-        _HFE_PRESETS[_name] = _fn
+for _lvl in range(_HFE_LEVELS):
+    _name, _fn = _make_hfe_preset(_lvl)
+    _HFE_PRESETS[_name] = _fn
 
 
 # =====================================================================
@@ -1533,83 +1594,93 @@ def _sample_hfx(
 # --- Experimental sampler wrappers (base, no strength suffix) ---
 
 def sample_hfx_sharp(model, x, sigmas, extra_args=None, callback=None,
-                      disable=False):
+                      disable=False, eta: float = _HFX_ETA):
     """Unsharp mask on eps_2 -- amplifies model's fine-scale predictions."""
-    LOGGER.info(">>> hfx_sharp sampler invoked (%d sigmas)", len(sigmas))
+    LOGGER.info(">>> hfx_sharp sampler invoked (%d sigmas, eta=%.3f)",
+                len(sigmas), eta)
     return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='sharp')
+                       mode='sharp', eta=eta)
 
 
 def sample_hfx_boost(model, x, sigmas, extra_args=None, callback=None,
-                      disable=False):
+                      disable=False, eta: float = _HFX_ETA):
     """Uniform eps_2 scaling (lying sigma) -- larger steps toward prediction."""
-    LOGGER.info(">>> hfx_boost sampler invoked (%d sigmas)", len(sigmas))
+    LOGGER.info(">>> hfx_boost sampler invoked (%d sigmas, eta=%.3f)",
+                len(sigmas), eta)
     return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='boost')
+                       mode='boost', eta=eta)
 
 
 def sample_hfx_detail(model, x, sigmas, extra_args=None, callback=None,
-                       disable=False):
+                       disable=False, eta: float = _HFX_ETA):
     """Post-step HF injection from denoised_2 -- recovers smoothed detail."""
-    LOGGER.info(">>> hfx_detail sampler invoked (%d sigmas)", len(sigmas))
+    LOGGER.info(">>> hfx_detail sampler invoked (%d sigmas, eta=%.3f)",
+                len(sigmas), eta)
     return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='detail')
+                       mode='detail', eta=eta)
 
 
 def sample_hfx_stochastic(model, x, sigmas, extra_args=None, callback=None,
-                            disable=False):
+                            disable=False, eta: float = _HFX_ETA):
     """Structure-aware noise injection -- non-deterministic variation."""
-    LOGGER.info(">>> hfx_stochastic sampler invoked (%d sigmas)", len(sigmas))
+    LOGGER.info(">>> hfx_stochastic sampler invoked (%d sigmas, eta=%.3f)",
+                len(sigmas), eta)
     return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='stochastic')
+                       mode='stochastic', eta=eta)
 
 
 def sample_hfx_momentum(model, x, sigmas, extra_args=None, callback=None,
-                         disable=False):
+                         disable=False, eta: float = _HFX_ETA):
     """Cross-step temporal EMA -- amplifies direction of prediction change."""
-    LOGGER.info(">>> hfx_momentum sampler invoked (%d sigmas)", len(sigmas))
+    LOGGER.info(">>> hfx_momentum sampler invoked (%d sigmas, eta=%.3f)",
+                len(sigmas), eta)
     return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='momentum')
+                       mode='momentum', eta=eta)
 
 
 def sample_hfx_spectral(model, x, sigmas, extra_args=None, callback=None,
-                          disable=False):
+                          disable=False, eta: float = _HFX_ETA):
     """FFT frequency reshaping -- power-law spectral boost on eps_2."""
-    LOGGER.info(">>> hfx_spectral sampler invoked (%d sigmas)", len(sigmas))
+    LOGGER.info(">>> hfx_spectral sampler invoked (%d sigmas, eta=%.3f)",
+                len(sigmas), eta)
     return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='spectral')
+                       mode='spectral', eta=eta)
 
 
 def sample_hfx_orthogonal(model, x, sigmas, extra_args=None, callback=None,
-                            disable=False):
+                            disable=False, eta: float = _HFX_ETA):
     """Gram-Schmidt projection -- amplifies novel info from stage 2."""
-    LOGGER.info(">>> hfx_orthogonal sampler invoked (%d sigmas)", len(sigmas))
+    LOGGER.info(">>> hfx_orthogonal sampler invoked (%d sigmas, eta=%.3f)",
+                len(sigmas), eta)
     return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='orthogonal')
+                       mode='orthogonal', eta=eta)
 
 
 def sample_hfx_refine(model, x, sigmas, extra_args=None, callback=None,
-                       disable=False):
+                       disable=False, eta: float = _HFX_ETA):
     """ODE curvature-adaptive emphasis -- amplifies where integrator is least accurate."""
-    LOGGER.info(">>> hfx_refine sampler invoked (%d sigmas)", len(sigmas))
+    LOGGER.info(">>> hfx_refine sampler invoked (%d sigmas, eta=%.3f)",
+                len(sigmas), eta)
     return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='refine')
+                       mode='refine', eta=eta)
 
 
 def sample_hfx_focus(model, x, sigmas, extra_args=None, callback=None,
-                      disable=False):
+                      disable=False, eta: float = _HFX_ETA):
     """Value-domain power-law contrast -- amplifies dominant corrections."""
-    LOGGER.info(">>> hfx_focus sampler invoked (%d sigmas)", len(sigmas))
+    LOGGER.info(">>> hfx_focus sampler invoked (%d sigmas, eta=%.3f)",
+                len(sigmas), eta)
     return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='focus')
+                       mode='focus', eta=eta)
 
 
 def sample_hfx_coherence(model, x, sigmas, extra_args=None, callback=None,
-                           disable=False):
+                           disable=False, eta: float = _HFX_ETA):
     """Inter-stage phase coherence gating -- trusts structurally confident frequencies."""
-    LOGGER.info(">>> hfx_coherence sampler invoked (%d sigmas)", len(sigmas))
+    LOGGER.info(">>> hfx_coherence sampler invoked (%d sigmas, eta=%.3f)",
+                len(sigmas), eta)
     return _sample_hfx(model, x, sigmas, extra_args, callback, disable,
-                       mode='coherence')
+                       mode='coherence', eta=eta)
 
 
 # =====================================================================
@@ -1677,17 +1748,27 @@ def _make_hfx_preset(mode: str, level: int):
     value = sweep['values'][level]
 
     if param == 'eta':
-        def sampler(model_fn, x, sigmas, extra_args=None, callback=None,
-                    disable=False, _eta=value, _mode=mode):
-            return _sample_hfx(model_fn, x, sigmas, extra_args, callback,
-                               disable, mode=_mode, eta=_eta)
+        def sampler(model, x, sigmas, extra_args=None, callback=None,
+                    disable=False, eta: float = value):
+            return _sample_hfx(model, x, sigmas, extra_args, callback,
+                               disable, mode=mode, eta=eta)
         desc = f"eta={value:.2f}"
     else:
-        kwarg = {param: value}
-        def sampler(model_fn, x, sigmas, extra_args=None, callback=None,
-                    disable=False, _mode=mode, _kw=kwarg):
-            return _sample_hfx(model_fn, x, sigmas, extra_args, callback,
-                               disable, mode=_mode, **_kw)
+        # Mode-specific param sweep (e.g. boost_factor, sde_strength).
+        # Expose eta as the standard universal knob and the per-mode
+        # param under its native name so ManualSampler can introspect
+        # both.
+        param_default = value
+
+        def _make_param_sampler():
+            def sampler(model, x, sigmas, extra_args=None, callback=None,
+                        disable=False, eta: float = _HFX_ETA,
+                        **mode_kwargs):
+                kw = {param: mode_kwargs.get(param, param_default), "eta": eta}
+                return _sample_hfx(model, x, sigmas, extra_args, callback,
+                                   disable, mode=mode, **kw)
+            return sampler
+        sampler = _make_param_sampler()
         desc = f"{param}={value}"
 
     name = f"hfx_{mode}_s{level + 1}"
@@ -2012,11 +2093,10 @@ def scheduler_logistic_detail(model_sampling: Any, steps: int) -> torch.Tensor:
 # =====================================================================
 
 _SAMPLERS: Dict[str, Any] = {}
-_SAMPLERS.update(_HFE_PRESETS)              # hfe_s1..s8, hfe3_s1..s8, hfe4_s1..s8, hfe5_s1..s8
-_SAMPLERS["hfe_auto"] = sample_hfe_auto     # 2-stage adaptive
-_SAMPLERS["hfe3_auto"] = sample_hfe3_auto   # 3-stage adaptive
-_SAMPLERS["hfe4_auto"] = sample_hfe4_auto   # 4-stage adaptive
-_SAMPLERS["hfe5_auto"] = sample_hfe5_auto   # 5-stage adaptive
+_SAMPLERS.update(_HFE_PRESETS)              # hfe_s1..s8 (2-stage default; stages kwarg up to 5)
+_SAMPLERS["hfe_auto"] = sample_hfe_auto     # adaptive (stages 2..5 via kwarg)
+# hfe3_auto / hfe4_auto / hfe5_auto and hfe3_s* / hfe4_s* / hfe5_s* have
+# been removed -- pick stages 2..5 via ManualSampler instead.
 # Experimental base samplers (10 fundamentally different modes)
 _SAMPLERS["hfx_sharp"] = sample_hfx_sharp
 _SAMPLERS["hfx_boost"] = sample_hfx_boost
@@ -2067,6 +2147,12 @@ _OLD_NAMES = [
     "hfx_sde_s1", "hfx_sde_s2", "hfx_sde_s3", "hfx_sde_s4",
     "hfx_spatial_s1", "hfx_spatial_s2", "hfx_spatial_s3", "hfx_spatial_s4",
 ]
+# 3/4/5-stage variants -- now reachable via sample_hfe_auto(stages=N) or
+# any sample_hfe_s<level>(stages=N) through ManualSampler.
+for _stages in (3, 4, 5):
+    _OLD_NAMES.append(f"hfe{_stages}_auto")
+    for _lvl in range(1, 9):
+        _OLD_NAMES.append(f"hfe{_stages}_s{_lvl}")
 
 
 def _unregister_old() -> None:

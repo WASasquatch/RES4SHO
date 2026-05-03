@@ -8,6 +8,7 @@
 // curve archetypes (sigmoid head, bezier middle, step tail, etc.).
 
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 
 // ----- Interpolators (used only for "apply curve to range") ----------
 
@@ -83,7 +84,366 @@ function applyRangeCurve(values, a, b, interp, tension) {
     }
 }
 
+// ----- Themed dialogs -------------------------------------------------
+//
+// Native browser prompt/alert/confirm look jarring next to ComfyUI's UI
+// and users mistake the popup for an error. These helpers build small
+// DOM dialogs that pull from the active theme's CSS variables (PrimeVue
+// names with legacy ComfyUI fallbacks) so they blend in regardless of
+// which theme is loaded.
+
+const _DIALOG_BG = "var(--p-overlay-modal-background, var(--comfy-menu-bg, #2a2a2a))";
+const _DIALOG_FG = "var(--p-text-color, var(--fg-color, #eee))";
+const _DIALOG_BORDER = "var(--p-overlay-modal-border-color, var(--border-color, #444))";
+const _INPUT_BG = "var(--p-form-field-background, var(--comfy-input-bg, #1a1a1a))";
+const _INPUT_FG = "var(--p-form-field-color, var(--input-text, #eee))";
+const _INPUT_BORDER = "var(--p-form-field-border-color, var(--border-color, #555))";
+const _BTN_BG = "var(--p-button-secondary-background, var(--comfy-input-bg, #3a3a3a))";
+const _BTN_FG = "var(--p-button-secondary-color, var(--fg-color, #eee))";
+const _BTN_BORDER = "var(--p-button-secondary-border-color, var(--border-color, #555))";
+const _BTN_PRIMARY_BG = "var(--p-button-primary-background, var(--p-primary-color, #4a8cd0))";
+const _BTN_PRIMARY_FG = "var(--p-button-primary-color, #fff)";
+const _BTN_PRIMARY_BORDER = "var(--p-button-primary-border-color, var(--p-primary-color, #4a8cd0))";
+
+function _makeOverlay() {
+    const overlay = document.createElement("div");
+    overlay.style.cssText = `
+        position: fixed; inset: 0;
+        background: rgba(0, 0, 0, 0.55);
+        z-index: 10000;
+        display: flex; align-items: center; justify-content: center;
+        font-family: var(--p-font-family, system-ui, -apple-system,
+                     "Segoe UI", sans-serif);
+    `;
+    return overlay;
+}
+
+function _makeDialog(minWidth = 360) {
+    const dlg = document.createElement("div");
+    dlg.style.cssText = `
+        background: ${_DIALOG_BG};
+        color: ${_DIALOG_FG};
+        border: 1px solid ${_DIALOG_BORDER};
+        border-radius: 6px;
+        padding: 18px 20px 16px;
+        min-width: ${minWidth}px; max-width: 520px;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+    `;
+    return dlg;
+}
+
+function _makeButton(label, primary = false) {
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.style.cssText = `
+        background: ${primary ? _BTN_PRIMARY_BG : _BTN_BG};
+        color: ${primary ? _BTN_PRIMARY_FG : _BTN_FG};
+        border: 1px solid ${primary ? _BTN_PRIMARY_BORDER : _BTN_BORDER};
+        padding: 6px 14px; border-radius: 4px;
+        cursor: pointer; font-size: 13px; font-family: inherit;
+        min-width: 72px;
+    `;
+    b.addEventListener("mouseenter", () => { b.style.opacity = "0.85"; });
+    b.addEventListener("mouseleave", () => { b.style.opacity = "1"; });
+    return b;
+}
+
+function showThemedPrompt({ title, message, defaultValue = "", placeholder = "",
+                            okLabel = "Save", cancelLabel = "Cancel" }) {
+    return new Promise((resolve) => {
+        const overlay = _makeOverlay();
+        const dlg = _makeDialog(380);
+
+        if (title) {
+            const t = document.createElement("div");
+            t.textContent = title;
+            t.style.cssText = "font-weight: 600; font-size: 14px; margin-bottom: 10px;";
+            dlg.appendChild(t);
+        }
+        if (message) {
+            const m = document.createElement("div");
+            m.textContent = message;
+            m.style.cssText = "font-size: 12px; line-height: 1.5; opacity: 0.85; "
+                + "margin-bottom: 12px; white-space: pre-wrap;";
+            dlg.appendChild(m);
+        }
+
+        const input = document.createElement("input");
+        input.type = "text";
+        input.value = defaultValue;
+        input.placeholder = placeholder;
+        input.style.cssText = `
+            width: 100%; box-sizing: border-box;
+            background: ${_INPUT_BG}; color: ${_INPUT_FG};
+            border: 1px solid ${_INPUT_BORDER};
+            padding: 7px 9px; border-radius: 4px;
+            font-size: 13px; font-family: inherit;
+            outline: none;
+        `;
+        dlg.appendChild(input);
+
+        const row = document.createElement("div");
+        row.style.cssText = "display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px;";
+        const cancelBtn = _makeButton(cancelLabel, false);
+        const okBtn = _makeButton(okLabel, true);
+        row.appendChild(cancelBtn);
+        row.appendChild(okBtn);
+        dlg.appendChild(row);
+
+        overlay.appendChild(dlg);
+        document.body.appendChild(overlay);
+        setTimeout(() => { input.focus(); input.select(); }, 0);
+
+        const close = (val) => {
+            if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+            resolve(val);
+        };
+        cancelBtn.onclick = () => close(null);
+        okBtn.onclick = () => close(input.value);
+        overlay.onclick = (e) => { if (e.target === overlay) close(null); };
+        input.onkeydown = (e) => {
+            if (e.key === "Enter") { e.preventDefault(); close(input.value); }
+            if (e.key === "Escape") { e.preventDefault(); close(null); }
+        };
+    });
+}
+
+function showThemedConfirm({ title, message, okLabel = "OK",
+                              cancelLabel = "Cancel", danger = false }) {
+    return new Promise((resolve) => {
+        const overlay = _makeOverlay();
+        const dlg = _makeDialog(340);
+
+        if (title) {
+            const t = document.createElement("div");
+            t.textContent = title;
+            t.style.cssText = "font-weight: 600; font-size: 14px; margin-bottom: 10px;";
+            dlg.appendChild(t);
+        }
+        const m = document.createElement("div");
+        m.textContent = message || "";
+        m.style.cssText = "font-size: 13px; line-height: 1.5; "
+            + "white-space: pre-wrap;";
+        dlg.appendChild(m);
+
+        const row = document.createElement("div");
+        row.style.cssText = "display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px;";
+        const cancelBtn = _makeButton(cancelLabel, false);
+        const okBtn = _makeButton(okLabel, true);
+        if (danger) {
+            okBtn.style.background = "var(--p-button-danger-background, #c44)";
+            okBtn.style.borderColor = "var(--p-button-danger-border-color, #c44)";
+        }
+        row.appendChild(cancelBtn);
+        row.appendChild(okBtn);
+        dlg.appendChild(row);
+
+        overlay.appendChild(dlg);
+        document.body.appendChild(overlay);
+        setTimeout(() => okBtn.focus(), 0);
+
+        const close = (val) => {
+            if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+            resolve(val);
+        };
+        cancelBtn.onclick = () => close(false);
+        okBtn.onclick = () => close(true);
+        overlay.onclick = (e) => { if (e.target === overlay) close(false); };
+        document.addEventListener("keydown", function onKey(e) {
+            if (!overlay.parentNode) {
+                document.removeEventListener("keydown", onKey, true);
+                return;
+            }
+            if (e.key === "Escape") { e.preventDefault(); close(false); }
+            if (e.key === "Enter")  { e.preventDefault(); close(true); }
+        }, true);
+    });
+}
+
+function showToast(message, kind = "info", duration = 3200) {
+    const toast = document.createElement("div");
+    toast.textContent = message;
+    const accent =
+        kind === "error"   ? "var(--p-button-danger-background, #c44)" :
+        kind === "success" ? "var(--p-button-success-background, #5a4)" :
+        kind === "warn"    ? "var(--p-button-warn-background, #d80)" :
+                             "var(--p-primary-color, #4a8cd0)";
+    toast.style.cssText = `
+        position: fixed; bottom: 24px; right: 24px;
+        background: ${_DIALOG_BG}; color: ${_DIALOG_FG};
+        border: 1px solid ${_DIALOG_BORDER};
+        border-left: 4px solid ${accent};
+        padding: 10px 16px; border-radius: 4px;
+        z-index: 10001; font-size: 13px; max-width: 380px;
+        font-family: var(--p-font-family, system-ui, sans-serif);
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+        white-space: pre-wrap; line-height: 1.4;
+        opacity: 0; transform: translateY(8px);
+        transition: opacity 0.18s, transform 0.18s;
+    `;
+    document.body.appendChild(toast);
+    requestAnimationFrame(() => {
+        toast.style.opacity = "1";
+        toast.style.transform = "translateY(0)";
+    });
+    setTimeout(() => {
+        toast.style.opacity = "0";
+        toast.style.transform = "translateY(8px)";
+        setTimeout(() => {
+            if (toast.parentNode) toast.parentNode.removeChild(toast);
+        }, 250);
+    }, duration);
+}
+
+// ----- Helpers --------------------------------------------------------
+
+// Last DOM mouse event we saw -- used as a fallback for LiteGraph
+// ContextMenu positioning when invoked from a widget button callback,
+// which doesn't itself receive the click event.
+let _lastInteractionEvent = null;
+if (typeof window !== "undefined") {
+    document.addEventListener("mousedown", (e) => {
+        _lastInteractionEvent = e;
+    }, true);
+    document.addEventListener("pointerdown", (e) => {
+        _lastInteractionEvent = e;
+    }, true);
+}
+
+function _eventFromLastMouse() {
+    const lm = app?.canvas?.last_mouse;
+    if (Array.isArray(lm) && lm.length >= 2) {
+        return { clientX: lm[0], clientY: lm[1] };
+    }
+    return { clientX: 200, clientY: 200 };
+}
+
 // ----- Server fetch ---------------------------------------------------
+
+async function refreshNodeDefs() {
+    // Mirrors the WAS_Extras pattern: poke ComfyUI to re-introspect every
+    // node definition so dropdowns (KSampler scheduler, etc.) pick up
+    // newly-registered preset schedulers without a full restart.
+    try {
+        const command = app?.extensionManager?.command;
+        if (command && typeof command.execute === "function") {
+            await command.execute("Comfy.RefreshNodeDefinitions");
+        }
+    } catch (e) {
+        console.warn("[SigmaCurves] RefreshNodeDefinitions failed:", e);
+    }
+}
+
+async function listPresetsServer() {
+    try {
+        const r = await fetch("/RES4SHO/sigma_curves/presets");
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const data = await r.json();
+        return data;
+    } catch (e) {
+        console.warn("[SigmaCurves] listPresets failed:", e);
+        return { presets: {}, prefix: "sigma_curve_" };
+    }
+}
+
+async function savePresetServer(name, values, scheduler, steps, trailing_zero) {
+    const r = await fetch("/RES4SHO/sigma_curves/preset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, values, scheduler, steps, trailing_zero }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+        throw new Error(data.error || ("HTTP " + r.status));
+    }
+    return data;
+}
+
+async function deletePresetServer(name) {
+    const r = await fetch(
+        `/RES4SHO/sigma_curves/preset?name=${encodeURIComponent(name)}`,
+        { method: "DELETE" });
+    const data = await r.json().catch(() => ({}));
+    return !!data.ok;
+}
+
+// Walk the graph from a SigmaCurves node's model input back through
+// reroutes / passthroughs until we hit a node that produces a MODEL.
+// Returns { loader_type, widgets_values } describing that loader, or
+// null if nothing usable is connected.
+function findConnectedModelLoader(node) {
+    if (!node || !Array.isArray(node.inputs)) return null;
+    const modelInput = node.inputs.find(inp => inp && inp.name === "model");
+    if (!modelInput || modelInput.link == null) return null;
+
+    const seen = new Set();
+    let linkId = modelInput.link;
+    while (linkId != null) {
+        const linkInfo = app.graph?.links?.[linkId];
+        if (!linkInfo) return null;
+        const sourceId = linkInfo.origin_id ?? linkInfo[1];
+        if (sourceId == null || seen.has(sourceId)) return null;
+        seen.add(sourceId);
+        const sourceNode = app.graph?.getNodeById?.(sourceId);
+        if (!sourceNode) return null;
+        // Common passthrough types that just forward MODEL: keep walking.
+        const t = sourceNode.type || sourceNode.comfyClass;
+        if (t === "Reroute" || t === "RerouteNode"
+            || t === "PrimitiveNode" || /^Reroute/i.test(t || "")) {
+            linkId = sourceNode.inputs?.[0]?.link;
+            continue;
+        }
+        // Otherwise treat this as the loader.
+        return {
+            loader_type: t,
+            widgets_values: Array.isArray(sourceNode.widgets_values)
+                ? [...sourceNode.widgets_values] : [],
+        };
+    }
+    return null;
+}
+
+async function fetchBaselineForLoader(scheduler, steps, loader) {
+    try {
+        const r = await fetch("/RES4SHO/sigma_curves/preview_for_loader", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                loader_type: loader.loader_type,
+                widgets_values: loader.widgets_values,
+                scheduler, steps,
+            }),
+        });
+        if (!r.ok) return null;
+        const data = await r.json();
+        if (!Array.isArray(data.values) || data.values.length < 2) return null;
+        // Resample if length doesn't match -- same fallback fetchBaseline uses.
+        let arr = data.values.map(v => clamp(+v, 0, 1));
+        const target = steps + 1;
+        if (arr.length !== target) {
+            const old = arr; const out = [];
+            for (let i = 0; i < target; i++) {
+                const t = i / Math.max(target - 1, 1) * (old.length - 1);
+                const lo = Math.floor(t);
+                const hi = Math.min(lo + 1, old.length - 1);
+                const frac = t - lo;
+                out.push(old[lo] * (1 - frac) + old[hi] * frac);
+            }
+            if (data.trailing_zero) out[out.length - 1] = 0;
+            arr = out;
+        }
+        return {
+            values: arr,
+            trailing_zero: !!data.trailing_zero,
+            fallback: false,
+            dispatch: data.dispatch || "real_model_live",
+            from_real_model: true,
+        };
+    } catch (e) {
+        console.warn("[SigmaCurves] preview_for_loader failed:", e);
+        return null;
+    }
+}
 
 async function fetchBaseline(scheduler, steps) {
     try {
@@ -102,6 +462,13 @@ async function fetchBaseline(scheduler, steps) {
         } else {
             console.debug(`${tag}  dispatch=${data.dispatch || "?"}`);
         }
+        // Whether the values came from the actual user model (either
+        // computed live against a currently-loaded model, or pulled
+        // from the cache populated by a prior workflow run) vs. our
+        // synthetic ModelSamplingDiscrete fallback. Drives the visual
+        // indicator in the plot header.
+        const isReal = data.dispatch === "real_model_cache"
+                    || data.dispatch === "real_model_live";
         if (Array.isArray(data.values) && data.values.length >= 2) {
             let arr = data.values.map(v => clamp(+v, 0, 1));
             // Some schedulers return steps+2 (or other lengths). Resample
@@ -130,6 +497,7 @@ async function fetchBaseline(scheduler, steps) {
                 trailing_zero: !!data.trailing_zero,
                 fallback: !!data.fallback,
                 dispatch: data.dispatch || "unknown",
+                from_real_model: isReal,
             };
         }
         throw new Error("invalid response shape");
@@ -138,7 +506,8 @@ async function fetchBaseline(scheduler, steps) {
         const v = [];
         for (let i = 0; i <= steps; i++) v.push(1 - i / Math.max(steps, 1));
         return { values: v, trailing_zero: true, fallback: true,
-                 dispatch: "frontend_linear_fallback" };
+                 dispatch: "frontend_linear_fallback",
+                 from_real_model: false };
     }
 }
 
@@ -198,6 +567,9 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
         tension: 0,
         lastValueSeen: null,
         lastFetched: null,   // {scheduler, steps} of the last successful fetch
+        fromRealModel: false, // true when the displayed curve was sourced
+                              // from a previous SigmaCurves.build() run
+                              // against the user's actual model.
     };
 
     function syncFromDataWidget() {
@@ -215,6 +587,38 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
             if (typeof obj.interp === "string") state.interp = obj.interp;
             if (typeof obj.tension === "number") state.tension = obj.tension;
         } catch (e) { /* keep what we have */ }
+
+        // Reconcile with the live steps widget. ComfyUI's workflow
+        // loader restores widget values via direct assignment, which
+        // does NOT fire our wrapped stepsWidget.callback. So a workflow
+        // saved at steps=20 and reloaded with steps=10 will have a
+        // 21-value curve_data but a widget showing 10 -- the plot would
+        // render the stale length. Resample state.values to match the
+        // widget and persist so the saved workflow stays consistent.
+        if (stepsWidget && state.values && state.values.length >= 2) {
+            const widgetSteps = (stepsWidget.value | 0) || state.steps || 20;
+            const targetN = widgetSteps + 1;
+            if (state.values.length !== targetN) {
+                const old = state.values;
+                const out = [];
+                for (let i = 0; i < targetN; i++) {
+                    const t = i / Math.max(targetN - 1, 1) * (old.length - 1);
+                    const lo = Math.floor(t);
+                    const hi = Math.min(lo + 1, old.length - 1);
+                    const frac = t - lo;
+                    out.push(old[lo] * (1 - frac) + old[hi] * frac);
+                }
+                state.values = out;
+                state.steps = widgetSteps;
+                state.selStart = state.selEnd = -1;
+                // Push so the widget value and curve_data agree on
+                // disk; subsequent comparisons by lastValueSeen short-
+                // circuit (no infinite loop).
+                pushToDataWidget();
+            } else {
+                state.steps = widgetSteps;
+            }
+        }
     }
 
     function pushToDataWidget() {
@@ -266,17 +670,30 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
             });
         } else {
             // Fallback if LiteGraph.ContextMenu isn't available.
-            const v = window.prompt(
-                `Curve type (one of: ${choices.join(", ")}):`, state.interp);
-            if (v && choices.includes(v)) {
-                state.interp = v;
-                pushToDataWidget();
-            }
+            showThemedPrompt({
+                title: "Curve type",
+                message: "Available: " + choices.join(", "),
+                defaultValue: state.interp,
+                okLabel: "Set",
+            }).then((v) => {
+                if (v && choices.includes(v)) {
+                    state.interp = v;
+                    pushToDataWidget();
+                }
+            });
         }
     }
 
-    function promptTension() {
-        const v = window.prompt("Tension (0-30):", String(state.tension));
+    async function promptTension() {
+        const v = await showThemedPrompt({
+            title: "Curve tension",
+            message: "Steepness for sigmoid / atan / ease curves "
+                + "(ignored by linear, cosine, smoothstep). 0 disables; "
+                + "typical range 2 – 12.",
+            defaultValue: String(state.tension),
+            placeholder: "0 - 30",
+            okLabel: "Set",
+        });
         if (v === null) return;
         const num = parseFloat(v);
         if (!isNaN(num)) {
@@ -288,10 +705,24 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
     async function refreshBaseline() {
         const sch = schedulerWidget?.value || "normal";
         const stp = stepsWidget?.value || 20;
-        const result = await fetchBaseline(sch, stp);
+
+        // First try: walk the graph back to the connected model loader
+        // and have the backend run BasicScheduler against THAT loader's
+        // model directly. This is the path the user expects -- no need
+        // to run the workflow first.
+        let result = null;
+        const loader = findConnectedModelLoader(node);
+        if (loader && loader.loader_type) {
+            result = await fetchBaselineForLoader(sch, stp, loader);
+        }
+        // Fallback: the generic preview endpoint (cache or any
+        // currently-loaded model or synthetic).
+        if (!result) result = await fetchBaseline(sch, stp);
+
         state.scheduler = sch;
         state.steps = stp;
         state.values = result.values;
+        state.fromRealModel = !!result.from_real_model;
         state.selStart = state.selEnd = -1;
         state.lastFetched = { scheduler: sch, steps: stp };
         pushToDataWidget();
@@ -525,8 +956,11 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
             const sel = (state.selStart >= 0 && state.selEnd >= 0)
                 ? `range [${Math.min(state.selStart, state.selEnd)}..${Math.max(state.selStart, state.selEnd)}]`
                 : "no range";
-            ctx.fillStyle = (state.selStart >= 0) ? "#fc0" : "#bbb";
-            ctx.fillText(`${state.scheduler} | ${n - 1} steps | ${sel}`,
+            const sourceTag = state.fromRealModel ? " ✓ from your model"
+                                                   : " ≈ approximate";
+            ctx.fillStyle = (state.selStart >= 0) ? "#fc0"
+                : (state.fromRealModel ? "#7d8" : "#bbb");
+            ctx.fillText(`${state.scheduler} | ${n - 1} steps | ${sel}${sourceTag}`,
                          ox + rect.x, oy + HEADER_Y);
             ctx.textAlign = "right";
             ctx.fillStyle = "#777";
@@ -776,6 +1210,112 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
         },
         { serialize: false },
     );
+    node.addWidget(
+        "button", "save preset…", null,
+        async () => {
+            if (!state.values) return;
+            const name = await showThemedPrompt({
+                title: "Save sigma curve as preset",
+                message: "Allowed: letters, digits, spaces, dashes, "
+                    + "underscores (max 64 chars). The preset will appear "
+                    + "in every scheduler dropdown as "
+                    + "\"sigma_curve_<name>\" once the node definitions "
+                    + "refresh.",
+                placeholder: "e.g. my_atan_steep",
+                okLabel: "Save",
+            });
+            if (name === null) return;
+            const trimmed = String(name).trim();
+            if (!trimmed) return;
+            try {
+                const result = await savePresetServer(
+                    trimmed,
+                    state.values,
+                    state.scheduler,
+                    state.steps,
+                    true,
+                );
+                await refreshNodeDefs();
+                showToast(
+                    `Saved "${trimmed}".\n`
+                    + `Available as "${result.scheduler || ("sigma_curve_" + trimmed)}" `
+                    + "in scheduler dropdowns.",
+                    "success");
+            } catch (e) {
+                showToast("Save failed: " + e.message, "error");
+            }
+        },
+        { serialize: false },
+    );
+    node.addWidget(
+        "button", "load preset…", null,
+        async () => {
+            const data = await listPresetsServer();
+            const names = Object.keys(data.presets || {});
+            if (!names.length) {
+                showToast(
+                    "No saved presets yet. Edit a curve and use "
+                    + "\"save preset…\" first.", "info");
+                return;
+            }
+            const evt = (typeof event !== "undefined" ? event : null)
+                || _lastInteractionEvent
+                || _eventFromLastMouse();
+            new LiteGraph.ContextMenu(names, {
+                event: evt,
+                callback: (selected) => {
+                    const p = data.presets[selected];
+                    if (!p || !Array.isArray(p.values)) return;
+                    state.values = p.values.slice();
+                    state.selStart = state.selEnd = -1;
+                    if (typeof p.steps === "number" && p.steps > 0
+                        && stepsWidget && stepsWidget.value !== p.steps) {
+                        stepsWidget.value = p.steps;
+                        state.steps = p.steps;
+                    }
+                    pushToDataWidget();
+                    showToast(`Loaded "${selected}".`, "success", 2000);
+                },
+            });
+        },
+        { serialize: false },
+    );
+    node.addWidget(
+        "button", "delete preset…", null,
+        async () => {
+            const data = await listPresetsServer();
+            const names = Object.keys(data.presets || {});
+            if (!names.length) {
+                showToast("No saved presets to delete.", "info");
+                return;
+            }
+            const evt = (typeof event !== "undefined" ? event : null)
+                || _lastInteractionEvent
+                || _eventFromLastMouse();
+            new LiteGraph.ContextMenu(names, {
+                event: evt,
+                callback: async (selected) => {
+                    const ok = await showThemedConfirm({
+                        title: "Delete preset?",
+                        message: `Delete preset "${selected}"?\n\n`
+                            + "This also unregisters its "
+                            + `"sigma_curve_${selected}" scheduler.`,
+                        okLabel: "Delete",
+                        danger: true,
+                    });
+                    if (!ok) return;
+                    const success = await deletePresetServer(selected);
+                    if (success) {
+                        await refreshNodeDefs();
+                        showToast(`Deleted "${selected}".`, "success", 2000);
+                    } else {
+                        showToast("Delete failed.", "error");
+                    }
+                },
+            });
+        },
+        { serialize: false },
+    );
 
     // Initial population: prefer saved curve_data, else fetch fresh.
     syncFromDataWidget();
@@ -803,28 +1343,41 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
 // LiteGraph never sees them.
 if (typeof window !== "undefined" && !window.__res4sho_events_installed) {
     window.__res4sho_events_installed = true;
+    console.info("[SigmaCurves] document-level right-click drag listeners installed.");
 
     function _findSigmaPlot(e) {
-        const cv = app.canvas?.canvas;
-        if (!cv) return null;
+        // Robust against frontend version differences -- probe a few
+        // attribute paths the canvas / graph have lived under.
+        const canvas = app?.canvas;
+        const cv = canvas?.canvas || canvas?.canvasElement;
+        if (!cv || typeof cv.getBoundingClientRect !== "function") {
+            return null;
+        }
         const r = cv.getBoundingClientRect();
         const cx = e.clientX - r.left;
         const cy = e.clientY - r.top;
-        const ds = app.canvas.ds;
-        if (!ds) return null;
+
+        const ds = canvas.ds || canvas.dragAndScale;
+        if (!ds || !Array.isArray(ds.offset) || typeof ds.scale !== "number") {
+            return null;
+        }
         const gx = (cx - ds.offset[0]) / ds.scale;
         const gy = (cy - ds.offset[1]) / ds.scale;
-        const nodes = app.graph?._nodes || [];
+
+        const graph = app.graph || canvas.graph;
+        const nodes = graph?._nodes || graph?.nodes || [];
         for (const n of nodes) {
-            if (n.type !== "SigmaCurves") continue;
-            // Title bar typically extends ~30px above pos. Match LiteGraph's
-            // own bounding-box test loosely.
+            const t = n.type || n.comfyClass;
+            if (t !== "SigmaCurves") continue;
             const titleH = 30;
             if (gx < n.pos[0] || gx > n.pos[0] + n.size[0]) continue;
             if (gy < n.pos[1] - titleH || gy > n.pos[1] + n.size[1]) continue;
             const w = (n.widgets || []).find(
-                (w) => w && w.type === "sigma_curve_steps");
-            if (!w || w.last_y == null) continue;
+                (ww) => ww && ww.type === "sigma_curve_steps");
+            if (!w) continue;
+            // last_y starts at 0 (set by draw on first paint). Treat
+            // 0 as valid; only bail on null/undefined.
+            if (w.last_y == null) continue;
             const localX = gx - n.pos[0];
             const localY = gy - n.pos[1] - w.last_y;
             return { node: n, widget: w, localX, localY };
@@ -837,7 +1390,19 @@ if (typeof window !== "undefined" && !window.__res4sho_events_installed) {
     document.addEventListener("pointerdown", (e) => {
         if (e.button !== 2) return;
         const hit = _findSigmaPlot(e);
-        if (!hit) return;
+        if (!hit) {
+            // Fires often (every right-click anywhere on canvas), so
+            // debug-level only.
+            if (e.target && e.target.tagName === "CANVAS") {
+                console.debug(
+                    "[SigmaCurves] right-click on canvas but no SigmaCurves node "
+                    + "matched at this position (or canvas/graph not resolvable). "
+                    + "app.canvas=", !!app?.canvas,
+                    "app.canvas.ds=", !!app?.canvas?.ds,
+                    "app.graph._nodes=", app?.graph?._nodes?.length);
+            }
+            return;
+        }
         const handled = hit.widget._sigmaRightDown?.(
             hit.localX, hit.localY, hit.node);
         if (handled) {
@@ -845,6 +1410,10 @@ if (typeof window !== "undefined" && !window.__res4sho_events_installed) {
             window.__res4sho_suppress_ctxmenu = true;
             e.preventDefault();
             e.stopPropagation();
+        } else {
+            console.debug(
+                "[SigmaCurves] right-click fell through _sigmaRightDown -- "
+                + "click was outside the plot rect. local=", hit.localX, hit.localY);
         }
     }, true);
 
@@ -884,6 +1453,35 @@ if (typeof window !== "undefined" && !window.__res4sho_events_installed) {
     }, true);
 }
 
+// Listen for the backend "sigmas_updated" websocket event that
+// SigmaCurves.build() pushes after each workflow run. When it fires,
+// every SigmaCurves node whose scheduler / steps match (or any node, to
+// keep it simple) re-fetches its preview so the canvas snaps to the
+// real-model shape immediately after the first execution.
+if (typeof window !== "undefined" && !window.__res4sho_ws_listener) {
+    window.__res4sho_ws_listener = true;
+    api.addEventListener("res4sho.sigmas_updated", (event) => {
+        const detail = event?.detail || {};
+        const sch = detail.scheduler;
+        const stp = detail.steps;
+        const nodes = app.graph?._nodes || [];
+        for (const n of nodes) {
+            if (n.type !== "SigmaCurves") continue;
+            const sw = (n.widgets || []).find(w => w.name === "scheduler");
+            const tw = (n.widgets || []).find(w => w.name === "steps");
+            if (!sw || !tw) continue;
+            if (sch && sw.value !== sch) continue;
+            if (stp != null && tw.value !== stp) continue;
+            // Trigger a refresh by clearing dataWidget value so the
+            // node's draw() sync re-fetches. Or call refreshBaseline
+            // via the wrapped scheduler callback.
+            if (typeof sw.callback === "function") {
+                try { sw.callback(sw.value, app.canvas, n); } catch (e) {}
+            }
+        }
+    });
+}
+
 app.registerExtension({
     name: "RES4SHO.SigmaCurves",
 
@@ -901,6 +1499,17 @@ app.registerExtension({
 
             dataWidget.type = "hidden";
             dataWidget.computeSize = () => [0, -4];
+            // Defensive: never let curve_data serialize as null. Some
+            // third-party extensions wrap serializeValue and call
+            // ``value.replace(...)`` -- a null value crashes graphToPrompt
+            // before the workflow can run.
+            if (dataWidget.value == null) dataWidget.value = "";
+            const _origSerializeCurve = dataWidget.serializeValue;
+            dataWidget.serializeValue = function () {
+                const v = (typeof _origSerializeCurve === "function")
+                    ? _origSerializeCurve.apply(this, arguments) : this.value;
+                return v == null ? "" : v;
+            };
 
             const w = makeStepCurveWidget(this, schedulerWidget, stepsWidget, dataWidget);
             this.addCustomWidget(w);
