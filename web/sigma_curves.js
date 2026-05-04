@@ -513,39 +513,85 @@ async function fetchBaseline(scheduler, steps) {
 
 // ----- Widget --------------------------------------------------------
 
-const HEIGHT = 280;
+const HEIGHT = 300;
 const PAD_L = 42, PAD_R = 12, PAD_B = 26;
 const POINT_R = 4;
 const HIT_R = 8;
 
-// Toolbar: header text at y=2, then a strip at y=18 with curve/tension/apply
-// buttons. Plot starts at y=44 (PLOT_TOP) leaving the toolbar room above.
+// Two-row in-canvas toolbar above the plot. Row 1 holds curve interp +
+// selection ops; row 2 holds reset baseline + preset ops. The plot
+// starts below both rows.
 const HEADER_Y = 2;
-const TOOLBAR_Y = 18;
+const TOOLBAR1_Y = 18;
+const TOOLBAR2_Y = 42;
 const TOOLBAR_H = 22;
-const PLOT_TOP = TOOLBAR_Y + TOOLBAR_H + 4;
+const PLOT_TOP = TOOLBAR2_Y + TOOLBAR_H + 4;
+const MIN_WIDGET_WIDTH = 440;
+
+const TOOLBAR_KEYS = ["curve", "tension", "apply", "all", "clear", "flat",
+                      "reset", "save", "load", "del"];
+
+const TOOLBAR_TOOLTIPS = {
+    curve:   "curve type — interpolation across the active range",
+    tension: "curve tension (sigmoid / atan / ease / exp shape)",
+    apply:   "apply curve to range (or whole curve if no selection)",
+    all:     "select all steps as the active range",
+    clear:   "clear range selection",
+    flat:    "flatten range to its start value",
+    reset:   "reset to scheduler default (refetch baseline)",
+    save:    "save current curve as a named preset",
+    load:    "load a saved preset into this node",
+    del:     "delete a saved preset",
+};
 
 function toolbarRects(widgetWidth) {
-    const y = TOOLBAR_Y, h = TOOLBAR_H, x0 = PAD_L;
-    return {
-        y, h,
-        curve:   { x: x0,        y, w: 130, h },
-        tension: { x: x0 + 136,  y, w: 60,  h },
-        apply:   { x: x0 + 200,  y, w: 70,  h },
-    };
+    const x0 = PAD_L;
+    const right = Math.max(widgetWidth - PAD_R, x0 + 360);
+    const h = TOOLBAR_H;
+    const gap = 4;
+
+    // Row 1 LEFT - curve interp + apply (pinned to plot left edge)
+    const curve   = { x: x0,                                y: TOOLBAR1_Y, w: 100, h };
+    const tension = { x: curve.x + curve.w + gap,           y: TOOLBAR1_Y, w: 46,  h };
+    const apply   = { x: tension.x + tension.w + gap,       y: TOOLBAR1_Y, w: 50,  h };
+
+    // Row 1 RIGHT - selection ops (pinned to plot right edge)
+    const flat    = { x: right - 54,                        y: TOOLBAR1_Y, w: 54,  h };
+    const clear   = { x: flat.x - gap - 44,                 y: TOOLBAR1_Y, w: 44,  h };
+    const all     = { x: clear.x - gap - 36,                y: TOOLBAR1_Y, w: 36,  h };
+
+    // Row 2 LEFT - reset baseline
+    const reset   = { x: x0,                                y: TOOLBAR2_Y, w: 116, h };
+
+    // Row 2 RIGHT - preset ops
+    const del     = { x: right - 60,                        y: TOOLBAR2_Y, w: 60,  h };
+    const load    = { x: del.x - gap - 50,                  y: TOOLBAR2_Y, w: 50,  h };
+    const save    = { x: load.x - gap - 50,                 y: TOOLBAR2_Y, w: 50,  h };
+
+    return { h, curve, tension, apply, all, clear, flat, reset, save, load, del };
 }
 
 function inRect(r, x, y) {
     return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
 }
 
-function drawToolbarButton(ctx, r, ox, oy, label, active, hover) {
-    ctx.fillStyle = hover ? "#333" : "#222";
-    ctx.fillRect(ox + r.x, oy + r.y, r.w, r.h);
-    ctx.strokeStyle = active ? "#5cf" : "#3a3a3a";
-    ctx.lineWidth = 1;
-    ctx.strokeRect(ox + r.x + 0.5, oy + r.y + 0.5, r.w - 1, r.h - 1);
-    ctx.fillStyle = active ? "#fff" : "#aaa";
+function drawToolbarButton(ctx, r, ox, oy, label, opts) {
+    const { active = false, hover = false, disabled = false } = opts || {};
+    if (disabled) {
+        ctx.fillStyle = "#1c1c1c";
+        ctx.fillRect(ox + r.x, oy + r.y, r.w, r.h);
+        ctx.strokeStyle = "#2a2a2a";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(ox + r.x + 0.5, oy + r.y + 0.5, r.w - 1, r.h - 1);
+        ctx.fillStyle = "#555";
+    } else {
+        ctx.fillStyle = hover ? "#333" : "#222";
+        ctx.fillRect(ox + r.x, oy + r.y, r.w, r.h);
+        ctx.strokeStyle = active ? "#5cf" : "#3a3a3a";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(ox + r.x + 0.5, oy + r.y + 0.5, r.w - 1, r.h - 1);
+        ctx.fillStyle = active ? "#fff" : "#cfd1d3";
+    }
     ctx.font = "11px monospace";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
@@ -800,12 +846,142 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
     }
 
     function findToolbarHit(widgetWidth, localX, localY) {
+        if (localY < TOOLBAR1_Y || localY > TOOLBAR2_Y + TOOLBAR_H) return null;
         const tb = toolbarRects(widgetWidth);
-        if (localY < tb.y || localY > tb.y + tb.h) return null;
-        if (inRect(tb.curve, localX, localY)) return "curve";
-        if (inRect(tb.tension, localX, localY)) return "tension";
-        if (inRect(tb.apply, localX, localY)) return "apply";
+        for (const key of TOOLBAR_KEYS) {
+            if (inRect(tb[key], localX, localY)) return key;
+        }
         return null;
+    }
+
+    function selectAllRange() {
+        if (!state.values) return;
+        state.selStart = 0;
+        state.selEnd = state.values.length - 1;
+        node.setDirtyCanvas(true, true);
+    }
+
+    function clearRange() {
+        if (state.selStart < 0 && state.selEnd < 0) return;
+        state.selStart = state.selEnd = -1;
+        node.setDirtyCanvas(true, true);
+    }
+
+    function flattenRange() {
+        if (!state.values || state.selStart < 0 || state.selEnd < 0) return;
+        const lo = Math.min(state.selStart, state.selEnd);
+        const hi = Math.max(state.selStart, state.selEnd);
+        const v = state.values[lo];
+        for (let i = lo; i <= hi; i++) state.values[i] = v;
+        pushToDataWidget();
+    }
+
+    async function savePresetUI() {
+        if (!state.values) return;
+        const name = await showThemedPrompt({
+            title: "Save sigma curve as preset",
+            message: "Allowed: letters, digits, spaces, dashes, "
+                + "underscores (max 64 chars). The preset will appear "
+                + "in every scheduler dropdown as "
+                + "\"sigma_curve_<name>\" once the node definitions "
+                + "refresh.",
+            placeholder: "e.g. my_atan_steep",
+            okLabel: "Save",
+        });
+        if (name === null) return;
+        const trimmed = String(name).trim();
+        if (!trimmed) return;
+        try {
+            const result = await savePresetServer(
+                trimmed,
+                state.values,
+                state.scheduler,
+                state.steps,
+                true,
+            );
+            await refreshNodeDefs();
+            showToast(
+                `Saved "${trimmed}".\n`
+                + `Available as "${result.scheduler || ("sigma_curve_" + trimmed)}" `
+                + "in scheduler dropdowns.",
+                "success");
+        } catch (e) {
+            showToast("Save failed: " + e.message, "error");
+        }
+    }
+
+    async function loadPresetUI(event) {
+        const data = await listPresetsServer();
+        const names = Object.keys(data.presets || {});
+        if (!names.length) {
+            showToast(
+                "No saved presets yet. Edit a curve and use "
+                + "\"save…\" first.", "info");
+            return;
+        }
+        const evt = event || _lastInteractionEvent || _eventFromLastMouse();
+        new LiteGraph.ContextMenu(names, {
+            event: evt,
+            callback: (selected) => {
+                const p = data.presets[selected];
+                if (!p || !Array.isArray(p.values)) return;
+                state.values = p.values.slice();
+                state.selStart = state.selEnd = -1;
+                if (typeof p.steps === "number" && p.steps > 0
+                    && stepsWidget && stepsWidget.value !== p.steps) {
+                    stepsWidget.value = p.steps;
+                    state.steps = p.steps;
+                }
+                pushToDataWidget();
+                showToast(`Loaded "${selected}".`, "success", 2000);
+            },
+        });
+    }
+
+    async function deletePresetUI(event) {
+        const data = await listPresetsServer();
+        const names = Object.keys(data.presets || {});
+        if (!names.length) {
+            showToast("No saved presets to delete.", "info");
+            return;
+        }
+        const evt = event || _lastInteractionEvent || _eventFromLastMouse();
+        new LiteGraph.ContextMenu(names, {
+            event: evt,
+            callback: async (selected) => {
+                const ok = await showThemedConfirm({
+                    title: "Delete preset?",
+                    message: `Delete preset "${selected}"?\n\n`
+                        + "This also unregisters its "
+                        + `"sigma_curve_${selected}" scheduler.`,
+                    okLabel: "Delete",
+                    danger: true,
+                });
+                if (!ok) return;
+                const success = await deletePresetServer(selected);
+                if (success) {
+                    await refreshNodeDefs();
+                    showToast(`Deleted "${selected}".`, "success", 2000);
+                } else {
+                    showToast("Delete failed.", "error");
+                }
+            },
+        });
+    }
+
+    function handleToolbarClick(key, event) {
+        switch (key) {
+            case "curve":   showCurveDropdown(event); break;
+            case "tension": promptTension(); break;
+            case "apply":   applyToSelection(); break;
+            case "all":     selectAllRange(); break;
+            case "clear":   clearRange(); break;
+            case "flat":    flattenRange(); break;
+            case "reset":   refreshBaseline(); break;
+            case "save":    savePresetUI(); break;
+            case "load":    loadPresetUI(event); break;
+            case "del":     deletePresetUI(event); break;
+        }
     }
 
     function findStep(rect, px, py) {
@@ -962,44 +1138,95 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
                 : (state.fromRealModel ? "#7d8" : "#bbb");
             ctx.fillText(`${state.scheduler} | ${n - 1} steps | ${sel}${sourceTag}`,
                          ox + rect.x, oy + HEADER_Y);
+            // Right side: tooltip when toolbar hovered, else interaction hints.
             ctx.textAlign = "right";
-            ctx.fillStyle = "#777";
-            ctx.fillText("L-drag y=adjust   R-drag=select range",
-                         ox + rect.x + rect.w, oy + HEADER_Y);
+            const tip = state.toolbarHover && TOOLBAR_TOOLTIPS[state.toolbarHover];
+            if (tip) {
+                ctx.fillStyle = "#5cf";
+                ctx.fillText(tip, ox + rect.x + rect.w, oy + HEADER_Y);
+            } else {
+                ctx.fillStyle = "#777";
+                ctx.fillText("L-drag y=adjust   R-drag=select range",
+                             ox + rect.x + rect.w, oy + HEADER_Y);
+            }
 
-            // Toolbar -- the in-canvas curve picker, tension input, apply.
+            // Toolbar -- two rows of in-canvas buttons spanning the plot.
             const tb = toolbarRects(widgetWidth);
-            const canApply = state.interp !== "custom"
-                && state.values
+            const hasSel = state.selStart >= 0 && state.selEnd >= 0;
+            const hasValues = !!state.values;
+            const canApply = state.interp !== "custom" && hasValues
                 && (() => {
-                    const lo = (state.selStart >= 0 && state.selEnd >= 0)
-                        ? Math.min(state.selStart, state.selEnd) : 0;
-                    const hi = (state.selStart >= 0 && state.selEnd >= 0)
-                        ? Math.max(state.selStart, state.selEnd) : state.values.length - 1;
+                    const lo = hasSel ? Math.min(state.selStart, state.selEnd) : 0;
+                    const hi = hasSel
+                        ? Math.max(state.selStart, state.selEnd)
+                        : state.values.length - 1;
                     return hi - lo >= 2;
                 })();
 
-            drawToolbarButton(ctx, tb.curve, ox, oy,
-                              `${state.interp} ▾`,
-                              state.interp !== "custom",
-                              state.toolbarHover === "curve");
+            // Row 1
+            drawToolbarButton(ctx, tb.curve, ox, oy, `${state.interp} ▾`,
+                { active: state.interp !== "custom",
+                  hover: state.toolbarHover === "curve" });
             drawToolbarButton(ctx, tb.tension, ox, oy,
-                              `k ${state.tension.toFixed(2)}`,
-                              state.tension !== 0,
-                              state.toolbarHover === "tension");
-            drawToolbarButton(ctx, tb.apply, ox, oy,
-                              "apply",
-                              canApply,
-                              canApply && state.toolbarHover === "apply");
+                `k ${state.tension.toFixed(2)}`,
+                { active: state.tension !== 0,
+                  hover: state.toolbarHover === "tension" });
+            drawToolbarButton(ctx, tb.apply, ox, oy, "apply",
+                { active: canApply,
+                  hover: canApply && state.toolbarHover === "apply",
+                  disabled: !canApply });
+            drawToolbarButton(ctx, tb.all, ox, oy, "all",
+                { hover: hasValues && state.toolbarHover === "all",
+                  disabled: !hasValues });
+            drawToolbarButton(ctx, tb.clear, ox, oy, "clear",
+                { active: hasSel,
+                  hover: hasSel && state.toolbarHover === "clear",
+                  disabled: !hasSel });
+            drawToolbarButton(ctx, tb.flat, ox, oy, "flatten",
+                { hover: hasSel && state.toolbarHover === "flat",
+                  disabled: !hasSel });
+            // Row 2
+            drawToolbarButton(ctx, tb.reset, ox, oy, "reset to default",
+                { hover: state.toolbarHover === "reset" });
+            drawToolbarButton(ctx, tb.save, ox, oy, "save…",
+                { hover: hasValues && state.toolbarHover === "save",
+                  disabled: !hasValues });
+            drawToolbarButton(ctx, tb.load, ox, oy, "load…",
+                { hover: state.toolbarHover === "load" });
+            drawToolbarButton(ctx, tb.del, ox, oy, "delete…",
+                { hover: state.toolbarHover === "del" });
 
             ctx.restore();
         },
 
         mouse(event, pos, gnode) {
-            if (!state.values) return false;
-            const rect = plotRect(gnode.size[0]);
+            const widgetWidth = gnode.size[0];
             const localX = pos[0];
             const localY = pos[1] - this.last_y;
+            const evType = event.type;
+            const button = (event.button !== undefined) ? event.button : 0;
+
+            // Toolbar always responds, even before the baseline has
+            // loaded, so the user can still hit "load preset…" or
+            // "reset" on a node that hasn't fetched yet.
+            if (evType === "pointerdown" || evType === "mousedown") {
+                if (button === 0) {
+                    const tbHit = findToolbarHit(widgetWidth, localX, localY);
+                    if (tbHit) {
+                        handleToolbarClick(tbHit, event);
+                        return true;
+                    }
+                }
+            } else if (evType === "pointermove" || evType === "mousemove") {
+                const tbHover = findToolbarHit(widgetWidth, localX, localY);
+                if (tbHover !== state.toolbarHover) {
+                    state.toolbarHover = tbHover;
+                    node.setDirtyCanvas(true, true);
+                }
+            }
+
+            if (!state.values) return false;
+            const rect = plotRect(widgetWidth);
             // Extend the hit area horizontally by HIT_R + a couple of pixels
             // so clicks on the LEFT half of step 0's dot (centered at
             // rect.x) and the RIGHT half of step N's dot (centered at
@@ -1010,9 +1237,6 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
             const inPlot = localX >= rect.x - HM && localX <= rect.x + rect.w + HM &&
                            localY >= rect.y && localY <= rect.y + rect.h;
 
-            const evType = event.type;
-            const button = (event.button !== undefined) ? event.button : 0;
-
             // Translate cursor X to the nearest step index.
             const stepFromX = (px) => {
                 const n = state.values.length;
@@ -1021,23 +1245,7 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
             };
 
             if (evType === "pointerdown" || evType === "mousedown") {
-                // In-canvas toolbar takes priority over plot interactions.
-                if (button === 0) {
-                    const tbHit = findToolbarHit(gnode.size[0], localX, localY);
-                    if (tbHit === "curve") {
-                        showCurveDropdown(event);
-                        return true;
-                    }
-                    if (tbHit === "tension") {
-                        promptTension();
-                        return true;
-                    }
-                    if (tbHit === "apply") {
-                        applyToSelection();
-                        return true;
-                    }
-                }
-
+                // Toolbar already handled above.
                 if (!inPlot) return false;
 
                 // Right-button anywhere in the plot: start a range drag.
@@ -1077,12 +1285,7 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
             }
 
             if (evType === "pointermove" || evType === "mousemove") {
-                // Update toolbar hover (works above the plot rect too).
-                const tbHover = findToolbarHit(gnode.size[0], localX, localY);
-                if (tbHover !== state.toolbarHover) {
-                    state.toolbarHover = tbHover;
-                    node.setDirtyCanvas(true, true);
-                }
+                // Toolbar hover already updated above.
                 // Right-drag to extend the range.
                 if (state.rightDragging) {
                     state.selEnd = stepFromX(localX);
@@ -1101,7 +1304,7 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
                     state.hover = newHover;
                     node.setDirtyCanvas(true, true);
                 }
-                return tbHover !== null || inPlot;
+                return state.toolbarHover !== null || inPlot;
             }
 
             if (evType === "pointerup" || evType === "mouseup") {
@@ -1172,158 +1375,36 @@ function makeStepCurveWidget(node, schedulerWidget, stepsWidget, dataWidget) {
         },
     };
 
-    // Curve / tension / apply UI lives inside the plot widget itself --
-    // the in-canvas toolbar drawn above the plot. See draw() and mouse()
-    // for the rendering and hit-testing of those controls.
-    node.addWidget(
-        "button", "select all steps", null,
-        () => {
-            if (!state.values) return;
-            state.selStart = 0;
-            state.selEnd = state.values.length - 1;
-            node.setDirtyCanvas(true, true);
-        },
-        { serialize: false },
-    );
-    node.addWidget(
-        "button", "clear range selection", null,
-        () => {
-            state.selStart = state.selEnd = -1;
-            node.setDirtyCanvas(true, true);
-        },
-        { serialize: false },
-    );
-    node.addWidget(
-        "button", "reset to scheduler default", null,
-        () => refreshBaseline(),
-        { serialize: false },
-    );
-    node.addWidget(
-        "button", "flatten range to start value", null,
-        () => {
-            if (!state.values || state.selStart < 0 || state.selEnd < 0) return;
-            const lo = Math.min(state.selStart, state.selEnd);
-            const hi = Math.max(state.selStart, state.selEnd);
-            const v = state.values[lo];
-            for (let i = lo; i <= hi; i++) state.values[i] = v;
-            pushToDataWidget();
-        },
-        { serialize: false },
-    );
-    node.addWidget(
-        "button", "save preset…", null,
-        async () => {
-            if (!state.values) return;
-            const name = await showThemedPrompt({
-                title: "Save sigma curve as preset",
-                message: "Allowed: letters, digits, spaces, dashes, "
-                    + "underscores (max 64 chars). The preset will appear "
-                    + "in every scheduler dropdown as "
-                    + "\"sigma_curve_<name>\" once the node definitions "
-                    + "refresh.",
-                placeholder: "e.g. my_atan_steep",
-                okLabel: "Save",
-            });
-            if (name === null) return;
-            const trimmed = String(name).trim();
-            if (!trimmed) return;
-            try {
-                const result = await savePresetServer(
-                    trimmed,
-                    state.values,
-                    state.scheduler,
-                    state.steps,
-                    true,
-                );
-                await refreshNodeDefs();
-                showToast(
-                    `Saved "${trimmed}".\n`
-                    + `Available as "${result.scheduler || ("sigma_curve_" + trimmed)}" `
-                    + "in scheduler dropdowns.",
-                    "success");
-            } catch (e) {
-                showToast("Save failed: " + e.message, "error");
-            }
-        },
-        { serialize: false },
-    );
-    node.addWidget(
-        "button", "load preset…", null,
-        async () => {
-            const data = await listPresetsServer();
-            const names = Object.keys(data.presets || {});
-            if (!names.length) {
-                showToast(
-                    "No saved presets yet. Edit a curve and use "
-                    + "\"save preset…\" first.", "info");
-                return;
-            }
-            const evt = (typeof event !== "undefined" ? event : null)
-                || _lastInteractionEvent
-                || _eventFromLastMouse();
-            new LiteGraph.ContextMenu(names, {
-                event: evt,
-                callback: (selected) => {
-                    const p = data.presets[selected];
-                    if (!p || !Array.isArray(p.values)) return;
-                    state.values = p.values.slice();
-                    state.selStart = state.selEnd = -1;
-                    if (typeof p.steps === "number" && p.steps > 0
-                        && stepsWidget && stepsWidget.value !== p.steps) {
-                        stepsWidget.value = p.steps;
-                        state.steps = p.steps;
-                    }
-                    pushToDataWidget();
-                    showToast(`Loaded "${selected}".`, "success", 2000);
-                },
-            });
-        },
-        { serialize: false },
-    );
-    node.addWidget(
-        "button", "delete preset…", null,
-        async () => {
-            const data = await listPresetsServer();
-            const names = Object.keys(data.presets || {});
-            if (!names.length) {
-                showToast("No saved presets to delete.", "info");
-                return;
-            }
-            const evt = (typeof event !== "undefined" ? event : null)
-                || _lastInteractionEvent
-                || _eventFromLastMouse();
-            new LiteGraph.ContextMenu(names, {
-                event: evt,
-                callback: async (selected) => {
-                    const ok = await showThemedConfirm({
-                        title: "Delete preset?",
-                        message: `Delete preset "${selected}"?\n\n`
-                            + "This also unregisters its "
-                            + `"sigma_curve_${selected}" scheduler.`,
-                        okLabel: "Delete",
-                        danger: true,
-                    });
-                    if (!ok) return;
-                    const success = await deletePresetServer(selected);
-                    if (success) {
-                        await refreshNodeDefs();
-                        showToast(`Deleted "${selected}".`, "success", 2000);
-                    } else {
-                        showToast("Delete failed.", "error");
-                    }
-                },
-            });
-        },
-        { serialize: false },
-    );
+    // All controls (curve, tension, apply, select-all/clear/flatten,
+    // reset, save/load/delete preset) live in the in-canvas toolbar
+    // drawn above the plot -- see draw() / mouse() / handleToolbarClick.
 
     // Initial population: prefer saved curve_data, else fetch fresh.
-    syncFromDataWidget();
-    if (!state.values || state.values.length !== (stepsWidget?.value || 20) + 1) {
-        refreshBaseline();
-    } else {
-        pushToDataWidget();
+    //
+    // ComfyUI restores widget values (including curve_data) via
+    // node.configure() AFTER onNodeCreated has run, so at this point the
+    // dataWidget on a workflow-loaded node is still empty. Defer the
+    // first-time check by a tick AND expose it so onConfigure can run it
+    // synchronously once curve_data has been restored. A guard makes
+    // both paths idempotent: whichever fires first wins; the other is a
+    // no-op.
+    let _initialized = false;
+    function ensureInitialized() {
+        if (_initialized) return;
+        _initialized = true;
+        syncFromDataWidget();
+        const targetN = (stepsWidget?.value || 20) + 1;
+        if (state.values && state.values.length === targetN) {
+            // Saved curve from workflow -- use it as-is.
+            pushToDataWidget();
+        } else {
+            // Fresh node (or stale saved data) -- fetch baseline.
+            refreshBaseline();
+        }
     }
+    setTimeout(ensureInitialized, 0);
+    widget._sigmaInit = ensureInitialized;
+    widget._sigmaSyncFromData = syncFromDataWidget;
 
     watchWidgets();
     return widget;
@@ -1497,8 +1578,28 @@ app.registerExtension({
             const stepsWidget = this.widgets?.find(w => w.name === "steps");
             if (!dataWidget) return r;
 
-            dataWidget.type = "hidden";
+            // Hide curve_data from the node UI. The legacy LiteGraph
+            // ``type = "hidden"`` trick works for canvas-drawn widgets
+            // but the modern Comfy Vue frontend renders STRING widgets
+            // as DOM <input> elements that ignore that flag and overlay
+            // the node body with the JSON blob. ``"converted-widget"``
+            // is the canonical type both frontends recognize as
+            // "do-not-render"; pair it with a 0-height computeSize
+            // (LiteGraph) and ``hidden = true`` (Vue/PrimeVue) plus an
+            // explicit DOM hide for any element the frontend already
+            // attached.
+            dataWidget.type = "converted-widget";
+            dataWidget.hidden = true;
             dataWidget.computeSize = () => [0, -4];
+            const hideDataElement = () => {
+                const el = dataWidget.element || dataWidget.inputEl;
+                if (el && el.style) el.style.display = "none";
+            };
+            hideDataElement();
+            requestAnimationFrame?.(hideDataElement);
+            setTimeout(hideDataElement, 0);
+            setTimeout(hideDataElement, 100);
+
             // Defensive: never let curve_data serialize as null. Some
             // third-party extensions wrap serializeValue and call
             // ``value.replace(...)`` -- a null value crashes graphToPrompt
@@ -1514,8 +1615,8 @@ app.registerExtension({
             const w = makeStepCurveWidget(this, schedulerWidget, stepsWidget, dataWidget);
             this.addCustomWidget(w);
 
-            const natural = this.computeSize?.() || [380, 540];
-            this.size = [Math.max(natural[0], 380), natural[1]];
+            const natural = this.computeSize?.() || [MIN_WIDGET_WIDTH, HEIGHT];
+            this.size = [Math.max(natural[0], MIN_WIDGET_WIDTH), natural[1]];
             this.setDirtyCanvas?.(true, true);
             return r;
         };
@@ -1523,6 +1624,22 @@ app.registerExtension({
         const onConfigure = nodeType.prototype.onConfigure;
         nodeType.prototype.onConfigure = function (info) {
             const r = onConfigure?.apply(this, arguments);
+            // After ComfyUI restores widget values from the workflow,
+            // sync state from the now-populated curve_data and run the
+            // one-shot init. This wins the race against the deferred
+            // setTimeout scheduled in onNodeCreated, so a saved curve
+            // is never overwritten by a stray refreshBaseline().
+            const w = (this.widgets || []).find(
+                ww => ww?.type === "sigma_curve_steps");
+            if (w) {
+                w._sigmaSyncFromData?.();
+                w._sigmaInit?.();
+            }
+            // Enforce min width on already-saved workflows whose nodes
+            // were narrower than the new toolbar requires.
+            if (Array.isArray(this.size) && this.size[0] < MIN_WIDGET_WIDTH) {
+                this.size[0] = MIN_WIDGET_WIDTH;
+            }
             this.setDirtyCanvas?.(true, true);
             return r;
         };
