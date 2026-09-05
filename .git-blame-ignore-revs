@@ -1,0 +1,6 @@
+# Bulk, no-op reformatting commits to skip in `git blame`.
+# Enable locally with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# Normalize line endings to LF via .gitattributes
+01f21e2d3653273bb2fe42b050adc7e4b3f7085c
