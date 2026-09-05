@@ -1,0 +1,5 @@
+# Normalize all text files to LF in the repo and in the working tree.
+# Without this, core.autocrlf grandfathers in files already committed as
+# CRLF (pyproject.toml, sampling.py), so editors and shell tools silently
+# flip them and every edit shows up as a whole-file diff.
+* text=auto eol=lf
