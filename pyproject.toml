@@ -8,15 +8,12 @@ license = { text = "MIT License" }
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
-    "Environment :: GPU :: NVIDIA CUDA",
-    "Environment :: GPU :: AMD ROCm",
-    "Environment :: GPU :: Apple Metal"
+    "Operating System :: OS Independent"
 ]
-dynamic = ["dependencies"]
-
-[tool.setuptools.dynamic]
-dependencies = { file = ["requirements.txt"] }
+# Pure-torch sampling code -- everything it imports (torch, tqdm, aiohttp)
+# already ships with ComfyUI. Declaring nothing here keeps the installer from
+# touching the user's existing torch build.
+dependencies = []
 
 [project.urls]
 Repository = "https://github.com/WASasquatch/RES4SHO"
@@ -25,4 +22,4 @@ Repository = "https://github.com/WASasquatch/RES4SHO"
 [tool.comfy]
 PublisherId = "was"
 DisplayName = "RES4SHO"
-requires-comfyui = ">=1.0.0"
+requires-comfyui = ">=0.3.11"
